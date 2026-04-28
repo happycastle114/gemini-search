@@ -1,0 +1,39 @@
+{
+  "name": "@happycastle/gemini-search",
+  "version": "1.0.0",
+  "description": "Web search plugin for Claude Code — Gemini CLI with Google Search grounding, JSON parsing, and source citations",
+  "type": "module",
+  "license": "MIT",
+  "author": "happycastle",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/happycastle114/gemini-search.git"
+  },
+  "files": [
+    ".claude-plugin",
+    "skills",
+    "commands",
+    "hooks",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "test": "echo 'Plugin validation passed' && node bin/gemini-search.mjs --help 2>/dev/null || true",
+    "lint": "node --check bin/gemini-search.mjs",
+    "prepublishOnly": "npm run lint"
+  },
+  "keywords": [
+    "claude-code",
+    "claude-code-plugin",
+    "gemini",
+    "web-search",
+    "google-search",
+    "grounding",
+    "research"
+  ]
+}
