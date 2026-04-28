@@ -20,6 +20,7 @@ import {
   parseAndValidate,
   parseArgs,
   terminateChild,
+  stripTerminalControls,
 } from '../bin/gemini-search.mjs';
 
 test('stripCode: fenced block citations are dropped', () => {
@@ -353,4 +354,65 @@ test('main: rejects oversize query (R8)', async (t) => {
   const code = await new Promise((resolve) => child.once('close', resolve));
   assert.equal(code, 1, 'oversize query must exit 1');
   assert.match(stderrBuf, /max is 32768/);
+});
+
+// ============================================================
+// Round 9 regressions
+// ============================================================
+
+test('stripCode: 4-space-indented fence-closer does NOT close real fence (R9 §4.5)', () => {
+  // CommonMark §4.5: fenced openers/closers may be indented at most 3
+  // spaces. A 4-space `\`\`\`` is indented code inside the still-open fence.
+  // The hidden citation must NOT leak through this false closer.
+  const md = [
+    '```',
+    'inside',
+    '    ```',
+    '[Source](https://hidden.example)',
+    '```',
+    '[Source](https://real.example)',
+    '## Sources',
+  ].join('\n');
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /hidden\.example/, '4-space-indented `\`\`\`` must not close the fence');
+  assert.match(out, /real\.example/);
+});
+
+test('stripCode: type-1 HTML opener mid-line is NOT a block opener (R9 §4.6 rule 1)', () => {
+  // CommonMark §4.6 rule 1: type-1 HTML blocks begin only when the opener
+  // tag starts the line (≤3 spaces of indent). Inline `<pre>` later in a
+  // line of prose is NOT a block opener and must NOT cause a real citation
+  // earlier on the same line to be dropped.
+  const md = 'prefix [Source](https://real.example) <pre>code</pre>\n## Sources';
+  const out = stripCode(md);
+  assert.match(out, /real\.example/, 'real citation before inline <pre> must survive');
+});
+
+test('formatResponse / stripTerminalControls: ANSI escapes in response are sanitized (R9)', () => {
+  // OSC title-set + CSI clear-screen + bare ESC sequences in upstream
+  // model output must not reach the user terminal. Validate the helper.
+  const dangerous = '\x1b]0;hijack\x07Hello\x1b[2JWorld\x1b[31mRed\x1b[0m';
+  const cleaned = stripTerminalControls(dangerous);
+  assert.equal(cleaned, 'HelloWorldRed', 'OSC, CSI, and SGR escapes must be removed');
+  // Newlines, tabs, CR are preserved.
+  assert.equal(stripTerminalControls('a\nb\tc\rd'), 'a\nb\tc\rd');
+  // Empty / non-string is passthrough.
+  assert.equal(stripTerminalControls(''), '');
+  assert.equal(stripTerminalControls(null), null);
+});
+
+test('main: rejects oversize prompt bytes (R9 multi-byte path)', async (t) => {
+  // A query within the char cap can still exceed argv byte limits when the
+  // system prompt is concatenated and the query is high-codepoint UTF-8.
+  // Force the byte cap to a tiny value to verify the rejection path.
+  const here = fileURLToPath(import.meta.url);
+  const realBin = resolve(here, '..', '..', 'bin', 'gemini-search.mjs');
+  const child = spawn(process.execPath, [realBin, 'short query'], {
+    env: { ...process.env, GEMINI_SEARCH_MAX_PROMPT_BYTES: '8' },
+  });
+  let stderrBuf = '';
+  child.stderr.on('data', (b) => { stderrBuf += b.toString(); });
+  const code = await new Promise((resolve) => child.once('close', resolve));
+  assert.equal(code, 1, 'oversize prompt-bytes must exit 1');
+  assert.match(stderrBuf, /max is 8/);
 });
