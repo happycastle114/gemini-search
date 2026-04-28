@@ -93,18 +93,15 @@ Search for the latest version of @anthropic-ai/sdk and list breaking changes
 from the previous major version. Include migration guide links if available.
 ```
 
-## Model Selection
+## Model Routing
 
-| Model | Best For | Speed |
-|-------|----------|-------|
-| `gemini-2.5-flash` | Quick lookups, fact checks | Fast |
-| `gemini-2.5-pro` | Deep research, comparisons | Slower |
-| `gemini-3-flash-preview` | Latest capabilities | Fast |
+`gemini-search` intentionally does **not** expose a model flag. Gemini CLI chooses the model using its own routing, your account tier, and your `~/.gemini/settings.json` configuration.
 
-Override the default model:
-```bash
-gemini-search -m gemini-2.5-pro "complex research query"
-```
+If you need to pin a model, set it in `~/.gemini/settings.json` under the `model.name` key — see the [Gemini CLI configuration reference](https://geminicli.com/docs/reference/configuration/). Do **not** pass `-m` to `gemini-search`; unknown flags now error out.
+
+## Privacy
+
+Every `gemini-search` invocation auto-disables Gemini CLI usage statistics (`privacy.usageStatisticsEnabled: false`) via a temporary system-override settings file. Your `~/.gemini/settings.json` and OAuth credentials are not modified. See the project README "Privacy" section for the auth-tier truth table — note that this CLI flag is **not** by itself a model-training opt-out on free OAuth or free Gemini API tiers.
 
 ## Tips
 

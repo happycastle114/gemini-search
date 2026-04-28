@@ -1,6 +1,6 @@
 # @happycastle/gemini-search
 
-Web search plugin for [Claude Code](https://code.claude.com) powered by [Gemini CLI](https://github.com/google-gemini/gemini-cli). Google Search grounding with structured JSON output, source citations, and research workflows.
+Web search plugin for [Claude Code](https://code.claude.com) powered by [Gemini CLI](https://github.com/google-gemini/gemini-cli). Google Search grounding with structured JSON output, **mandatory source citations**, and **privacy-hardened by default**.
 
 ## Architecture
 
@@ -17,8 +17,8 @@ Web search plugin for [Claude Code](https://code.claude.com) powered by [Gemini 
 │  │                         │                      │
 │  │  • Search-optimized     │                      │
 │  │    system prompt        │                      │
-│  │  • JSON response parse  │                      │
-│  │  • Citation formatting  │                      │
+│  │  • Mandatory citations  │                      │
+│  │  • Privacy auto-disable │                      │
 │  └───────────┬─────────────┘                      │
 └──────────────┼───────────────────────────────────-┘
                ▼
@@ -82,9 +82,6 @@ The `gemini-search` binary is added to PATH during Claude Code sessions:
 # Basic search
 gemini-search "latest Node.js LTS version"
 
-# Choose model
-gemini-search -m gemini-2.5-pro "React 19 vs Svelte 5 performance"
-
 # Raw JSON output (for scripting)
 gemini-search --raw "TypeScript 6 release date" | jq '.response'
 
@@ -92,15 +89,51 @@ gemini-search --raw "TypeScript 6 release date" | jq '.response'
 gemini-search --stream "comprehensive AI framework comparison"
 
 # Stdin
-echo "npm security advisories 2025" | gemini-search --stdin
+echo "npm security advisories 2026" | gemini-search --stdin
 ```
+
+The model is intentionally **not exposed as a flag**. Gemini CLI's own model routing (controlled by your `~/.gemini/settings.json`, account tier, and built-in `web-search` alias) picks the right model for the query. This keeps the wrapper future-proof against Google's model lineup changes.
 
 ## Configuration
 
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
-| `GEMINI_SEARCH_MODEL` | Default Gemini model | `gemini-2.5-flash` |
-| `GEMINI_SEARCH_TIMEOUT` | Request timeout (ms) | `120000` |
+| `GEMINI_SEARCH_TIMEOUT` | Request timeout (ms) | `600000` (10 min) |
+| `GEMINI_SEARCH_MAX_BUFFER` | Max stdout buffer in bytes for non-stream modes | `52428800` (50 MB) |
+
+To pin a specific model, set it in `~/.gemini/settings.json` under the `model.name` key — see the [Gemini CLI configuration reference](https://geminicli.com/docs/reference/configuration/).
+
+## Privacy
+
+`gemini-search` is privacy-hardened by default. **Every invocation auto-disables Gemini CLI usage statistics** without modifying your global `~/.gemini/settings.json`.
+
+### How it works
+
+On every call, the wrapper:
+
+1. Writes a temporary system-override settings file to `$TMPDIR/gemini-search-priv-XXXX/system.json` containing `{ "privacy": { "usageStatisticsEnabled": false } }`.
+2. Sets `GEMINI_CLI_SYSTEM_SETTINGS_PATH` to point Gemini CLI at this file. System overrides take precedence over user/project settings ([Gemini CLI docs](https://geminicli.com/docs/reference/configuration/#configuration-layers)).
+3. Deletes the temp directory after the request completes.
+
+The wrapper does not modify your `~/.gemini/settings.json` or OAuth credentials. Gemini CLI itself may still read or update its own runtime files such as auth tokens, session history, project registry, or installation metadata — those are managed by `gemini`, not by this wrapper.
+
+### What this disables
+
+- Gemini CLI usage statistics controlled by [`privacy.usageStatisticsEnabled`](https://geminicli.com/docs/reference/configuration/#privacy).
+
+### What this does NOT disable
+
+This wrapper does not change your Google account tier, API billing tier, Workspace/Code Assist license, or Vertex AI data-processing terms. **Account-tier model-training behavior is separate from this CLI usage-statistics setting.**
+
+| Auth method | Prompts used to train Google models? | Source |
+|-------------|--------------------------------------|--------|
+| Personal Google account (free OAuth) | **Yes**, under the free-tier terms | [Gemini CLI Terms & Privacy](https://geminicli.com/docs/resources/tos-privacy/) |
+| Gemini API key (free tier) | **Yes**, under Gemini API free-tier terms | [Gemini API Terms](https://ai.google.dev/gemini-api/terms) |
+| Gemini API key (paid tier) | **No** | [Gemini API Terms](https://ai.google.dev/gemini-api/terms) |
+| Google Workspace / Code Assist licensed | **No** | [Code Assist Privacy](https://developers.google.com/gemini-code-assist/resources/privacy-notice-gemini-code-assist-individuals) |
+| Vertex AI (`GOOGLE_GENAI_USE_VERTEXAI=true`) | **No** | [Vertex AI Data Governance](https://cloud.google.com/vertex-ai/generative-ai/docs/data-governance) |
+
+If you need a hard guarantee that your prompts are not used for model training, use **Vertex AI** or a **paid Gemini API key**. Setting `usageStatisticsEnabled: false` (which this wrapper does automatically) is **not** in itself a training opt-out on the free OAuth or free Gemini API tier — verify against the live Google docs above before treating it as such.
 
 ## Plugin Structure
 
@@ -132,10 +165,13 @@ gemini-search/
 
 ## How It Works
 
-1. **System prompt injection** — `gemini-search` wraps every query with a search-optimized system prompt that forces Gemini to use `google_web_search` for grounding
-2. **JSON parsing** — Uses `--output-format json` to get structured responses with token stats
-3. **Citation formatting** — Extracts and formats source URLs as markdown inline citations
-4. **Model routing** — Defaults to `gemini-2.5-flash` for speed; use `-m gemini-2.5-pro` for depth
+1. **Privacy override** — A per-invocation system-override settings file disables `privacy.usageStatisticsEnabled` without touching your global config or auth.
+2. **System prompt injection** — `gemini-search` wraps every query with a search-optimized prompt that forces Gemini to use `google_web_search` and **mandates inline `[Source](url)` citations** for every claim. The user query is fenced in a `<user_query>` block so prompt-injection attempts inside it cannot override the citation rule.
+3. **JSON parsing** — Uses `--output-format json` to get structured responses with token stats and grounding metadata. Malformed JSON or error payloads cause a non-zero exit rather than silent fall-through.
+4. **Citation enforcement** — The wrapper validates that the rendered markdown contains at least one inline `[Source](url)` link **and** a `Sources` section. Responses without both are rejected with a non-zero exit. The wrapper does not synthesize citations on its own.
+5. **True streaming** — `--stream` uses `spawn()` and pipes Gemini's `stream-json` output through stdout/stderr live, with no buffer cap.
+6. **No model flag** — Gemini CLI's built-in routing picks the right model. Override via `~/.gemini/settings.json` if needed.
+7. **Cleanup-safe** — Temp privacy override directory is removed in normal exit, error exit, and on `SIGINT`/`SIGTERM`.
 
 ## Development
 

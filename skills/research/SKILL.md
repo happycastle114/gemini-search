@@ -86,12 +86,18 @@ gemini-search "[library] known issues workarounds GitHub issues"
 
 ## Advanced: Streaming for Long Research
 
-For queries that may take longer, use streaming mode to see progress:
+For queries that may take longer, use streaming mode to see progress live:
 ```bash
 gemini-search --stream "comprehensive analysis of [complex topic]"
 ```
 
-This outputs JSONL events (`tool_use`, `tool_result`, `message`) so you can see when Gemini is searching and when it's synthesizing.
+This pipes Gemini's `stream-json` output through stdout in real time (no buffering, no buffer cap), so you can see when Gemini is searching and when it's synthesizing.
+
+## Model Routing & Privacy
+
+`gemini-search` does not expose a model flag — Gemini CLI's own routing picks the model. Pin one in `~/.gemini/settings.json` under `model.name` if needed.
+
+Every invocation auto-disables `privacy.usageStatisticsEnabled` via a temporary system-override settings file; your global config and OAuth credentials are not modified. See the project README "Privacy" section for the auth-tier truth table.
 
 ## Output Format
 
