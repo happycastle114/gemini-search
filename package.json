@@ -26,10 +26,10 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "test": "echo 'Plugin validation passed' && node bin/gemini-search.mjs --help 2>/dev/null || true",
+    "test": "node --test 'test/**/*.test.mjs'",
     "lint": "node --check bin/gemini-search.mjs",
     "release": "semantic-release",
-    "prepublishOnly": "npm run lint"
+    "prepublishOnly": "npm run lint && npm test"
   },
   "devDependencies": {
     "@semantic-release/commit-analyzer": "13.0.1",

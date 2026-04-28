@@ -36,6 +36,13 @@ jobs:
       - name: Validate bin script syntax
         run: node --check bin/gemini-search.mjs
 
+      # Round 6: regression tests for citation-stripping contract and
+      # terminateChild SIGTERM→SIGKILL fallback. These exercise the exact
+      # invariants Oracle has been finding bypasses for, so a regression
+      # would block merge instead of leaking into a release.
+      - name: Run unit tests
+        run: node --test 'test/**/*.test.mjs'
+
       - name: Validate hooks.json
         run: |
           if [ -f hooks/hooks.json ]; then

@@ -443,40 +443,90 @@ function formatLatency(ms) {
 const INLINE_CITATION_RE = /(?<!!)\[Source\]\((https?:\/\/[^\s)]+)(?:\s+"[^"]*")?\)/g;
 const SOURCES_SECTION_RE = /^## Sources\s*$/m;
 
-// Round 5: regex-based code stripping does not handle (a) unclosed fenced
-// blocks (the trailing ``` at EOF is missing — model render still treats
-// the rest as code), or (b) multi-backtick inline spans like ``foo``. We
-// scan the markdown line-by-line tracking fenced state explicitly, and
-// remove every inline-code span by repeatedly finding matched runs of N
-// backticks (N >= 1).
+// Round 5+6: regex-based stripping is insufficient. We do a CommonMark-
+// aware scan that tracks fenced blocks (``` / ~~~), indented code blocks
+// (4-space or tab prefix on a line that does NOT continue a paragraph),
+// raw-HTML <pre>/<code> blocks, and inline code spans of arbitrary
+// backtick-run length. Citations inside any of these must NOT count.
+//
+// Round 6 adds:
+//   - Indented code blocks (CommonMark §4.4): conservative — strip a line
+//     that starts with 4 spaces or a tab when the previous emitted line
+//     is blank (i.e. it is not a paragraph continuation). This avoids
+//     incorrectly stripping wrapped paragraph text while still catching
+//     the escape-hatch where a model embeds an indented citation.
+//   - Raw HTML block code: <pre>...</pre> and <code>...</code> (multi-
+//     line and inline). Citations inside these regions are rendered as
+//     code by GitHub-flavored markdown and must not satisfy the contract.
+//   - CRLF / leading BOM normalized at the entry point.
 function stripCode(markdown) {
-  const lines = markdown.split('\n');
+  // Normalize line endings + drop BOM so split('\n') behaves consistently
+  // for inputs that come back from the model with \r\n or \uFEFF prefix.
+  const normalized = markdown.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+
+  // First pass: blank out raw HTML <pre>...</pre> and <code>...</code>
+  // regions (case-insensitive, including attributes, multi-line). Replace
+  // with empty string so subsequent scanners don't see the inner content.
+  const htmlStripped = normalized
+    .replace(/<pre\b[^>]*>[\s\S]*?<\/pre\s*>/gi, '')
+    .replace(/<code\b[^>]*>[\s\S]*?<\/code\s*>/gi, '');
+
+  const lines = htmlStripped.split('\n');
   const out = [];
   let inFence = false;
   let fenceMarker = '';
+  let prevBlank = true;
+
   for (const line of lines) {
     const trimmed = line.replace(/^\s+/, '');
+
     // CommonMark fence opener / closer: 3+ backticks or 3+ tildes at the
-    // start of a line (allowing leading whitespace). A closer must use the
-    // same marker char as the opener and have at least as many chars. An
-    // unclosed opener swallows everything to EOF — exactly what a markdown
-    // renderer does — so citations after it must NOT be counted.
+    // start of a line (allowing leading whitespace). A closer must use
+    // the same marker char as the opener and have at least as many chars.
+    // An unclosed opener swallows everything to EOF — exactly what a
+    // markdown renderer does — so citations after it must NOT be counted.
     const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmed);
     if (fenceMatch) {
       const marker = fenceMatch[1];
       if (!inFence) {
         inFence = true;
         fenceMarker = marker[0].repeat(marker.length);
+        prevBlank = false;
         continue;
       }
       if (marker[0] === fenceMarker[0] && marker.length >= fenceMarker.length) {
         inFence = false;
         fenceMarker = '';
+        prevBlank = false;
         continue;
       }
     }
-    if (inFence) continue;
+    if (inFence) {
+      prevBlank = false;
+      continue;
+    }
+
+    // CommonMark §4.4 indented code block: a line indented by 4+ spaces
+    // (or a tab) that is NOT a paragraph continuation. We approximate
+    // "paragraph continuation" by checking whether the previous emitted
+    // line was blank. This keeps wrapped prose intact while dropping
+    // model-emitted indented citations.
+    const isIndentedCode = /^(?: {4}|\t)/.test(line) && trimmed.length > 0;
+    if (isIndentedCode && prevBlank) {
+      // Stays "in indented block" as long as following lines remain
+      // indented or blank — but we only need to drop this single line;
+      // the next iteration re-evaluates with prevBlank still effectively
+      // false-after-emit, so a contiguous indented block keeps dropping
+      // only because each line individually qualifies. To make the
+      // block-level semantics correct (subsequent indented lines still
+      // count as code even though prevBlank is now false), keep prevBlank
+      // logically true while we are inside the indented block.
+      // Implementation: do not change prevBlank to false on dropped lines.
+      continue;
+    }
+
     out.push(stripInlineCode(line));
+    prevBlank = trimmed.length === 0;
   }
   return out.join('\n');
 }
@@ -739,4 +789,26 @@ async function main() {
   }
 }
 
-main();
+// Round 6: only auto-run when this file is the process entry point. When
+// imported by the test harness for unit-level coverage of stripCode /
+// validateCitations / parseAndValidate, we MUST NOT spawn gemini.
+import { fileURLToPath as _fileURLToPath } from 'node:url';
+const __isMain = process.argv[1] && _fileURLToPath(import.meta.url) === process.argv[1];
+if (__isMain) {
+  main();
+}
+
+// Named exports for the test harness. Wrapper behavior is unchanged when
+// run as a CLI; these are tree-shakeable and never executed unless an
+// explicit ESM import names them.
+export {
+  stripCode,
+  stripInlineCode,
+  hasValidInlineCitation,
+  validateCitations,
+  parseAndValidate,
+  parseArgs,
+  terminateChild,
+  INLINE_CITATION_RE,
+  SOURCES_SECTION_RE,
+};
