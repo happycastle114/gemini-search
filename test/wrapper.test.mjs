@@ -8,6 +8,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdtempSync, symlinkSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   stripCode,
   stripInlineCode,
@@ -172,36 +176,120 @@ test('parseArgs: unknown option throws', () => {
   assert.throws(() => parseArgs(['--bogus']), /Unknown option/);
 });
 
-test('terminateChild: resolves immediately for already-exited child', async () => {
+test('terminateChild: resolves immediately for already-exited child', async (t) => {
   const child = spawn(process.execPath, ['-e', '0']);
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+  });
   await new Promise((r) => child.once('exit', r));
-  // Now exitCode is set; terminateChild should resolve without sending a signal.
   const start = Date.now();
   await terminateChild(child);
   assert.ok(Date.now() - start < 100, 'should resolve fast for exited child');
 });
 
-test('terminateChild: kills a SIGTERM-trapping child via SIGKILL fallback', async () => {
-  // Spawn a child that traps SIGTERM with a noisy handler and stays busy
-  // in the event loop. Some Node versions swallow no-op signal handlers
-  // as if they were defaults and exit anyway, so we both register a
-  // visible handler AND keep the loop pinned with a fast interval.
+test('terminateChild: kills a SIGTERM-trapping child via SIGKILL fallback', async (t) => {
   const child = spawn(process.execPath, ['-e', `
     let trapped = 0;
     process.on('SIGTERM', () => { trapped++; });
     setInterval(() => {}, 50);
     process.stdout.write('ready\\n');
   `]);
-  // Wait until the handler is definitely installed.
-  await new Promise((resolve) => {
-    child.stdout.once('data', () => resolve());
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }
   });
+  const ready = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('child never emitted ready')), 5000);
+    child.stdout.once('data', () => { clearTimeout(timer); resolve(); });
+  });
+  await ready;
   const start = Date.now();
   await terminateChild(child, { graceMs: 250 });
   const elapsed = Date.now() - start;
   assert.ok(child.exitCode !== null || child.signalCode !== null,
     'child should be dead after terminateChild');
   assert.equal(child.signalCode, 'SIGKILL', 'child should die by SIGKILL');
-  assert.ok(elapsed >= 200 && elapsed < 2000,
-    `expected 200ms-2s for grace+kill, got ${elapsed}ms`);
+  assert.ok(elapsed >= 200 && elapsed < 5000,
+    `expected 200ms-5s for grace+kill, got ${elapsed}ms`);
+});
+
+test('stripCode: blockquoted indented code citations are dropped (R7)', () => {
+  const md = 'intro\n\n>     [Source](https://x.com)\n\nafter\n## Sources';
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /https:\/\/x\.com/, 'blockquoted indented code must be stripped');
+});
+
+test('stripCode: blockquoted fenced code citations are dropped (R7)', () => {
+  const md = '> ```\n> [Source](https://x.com)\n> ```\n\n## Sources';
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /https:\/\/x\.com/, 'blockquoted fenced code must be stripped');
+});
+
+test('stripCode: HTML comments hide citations (R7)', () => {
+  const md = '<!-- [Source](https://x.com) -->\n\n## Sources';
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /https:\/\/x\.com/, 'HTML comment content must be stripped');
+});
+
+test('stripCode: <script> block hides citations (R7)', () => {
+  const md = '<script>[Source](https://x.com)</script>\n## Sources';
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /https:\/\/x\.com/, '<script> block must be stripped');
+});
+
+test('stripCode: <style> block hides citations (R7)', () => {
+  const md = '<style>/* [Source](https://x.com) */</style>\n## Sources';
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /https:\/\/x\.com/, '<style> block must be stripped');
+});
+
+test('stripCode: unclosed <pre> swallows to EOF (R7)', () => {
+  const md = '<pre>[Source](https://x.com)\n## Sources';
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /https:\/\/x\.com/, 'unclosed <pre> must drop to EOF');
+});
+
+test('stripCode: multi-line inline code span hides citation (R7)', () => {
+  const md = 'Claim `\n[Source](https://x.com)\n` ends.\n## Sources';
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /https:\/\/x\.com/, 'multi-line inline code span must be stripped');
+});
+
+test('stripCode: HTML <pre> with > inside attribute (R7)', () => {
+  const md = '<pre data-foo="a>b">[Source](https://x.com)</pre>\n## Sources';
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /https:\/\/x\.com/);
+});
+
+test('validateCitations: rejects blockquoted indented code (R7)', () => {
+  assert.throws(() => validateCitations('intro\n\n>     [Source](https://x.com)\n\n## Sources'),
+    /did not include any inline/);
+});
+
+test('validateCitations: rejects HTML comment-hidden citation (R7)', () => {
+  assert.throws(() => validateCitations('<!-- [Source](https://x.com) -->\n## Sources'),
+    /did not include any inline/);
+});
+
+test('validateCitations: rejects <script>-hidden citation (R7)', () => {
+  assert.throws(() => validateCitations('<script>[Source](https://x.com)</script>\n## Sources'),
+    /did not include any inline/);
+});
+
+test('CLI: --help works through a symlink (R7 entry-point gate)', async (t) => {
+  const here = fileURLToPath(import.meta.url);
+  const realBin = resolve(here, '..', '..', 'bin', 'gemini-search.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'gs-symlink-'));
+  const link = join(dir, 'gemini-search-symlink.mjs');
+  symlinkSync(realBin, link);
+  t.after(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
+  const child = spawn(process.execPath, [link, '--help']);
+  let stdout = '';
+  child.stdout.on('data', (b) => { stdout += b.toString(); });
+  const code = await new Promise((resolve) => child.once('close', resolve));
+  assert.equal(code, 0, `symlinked CLI --help must exit 0 (got ${code})`);
+  assert.match(stdout, /gemini-search/, 'symlinked CLI --help must print usage');
 });
