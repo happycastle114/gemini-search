@@ -82,6 +82,13 @@ function parseArgs(args) {
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
+    // Round 4: standard `--` terminator. Everything after `--` is positional,
+    // even if it starts with `-`. This lets users search for queries like
+    // `gemini-search -- "-foo bar"` without triggering "Unknown option".
+    if (arg === '--') {
+      for (let j = i + 1; j < args.length; j++) positional.push(args[j]);
+      break;
+    }
     switch (arg) {
       case '--help':
       case '-h':
@@ -105,6 +112,14 @@ function parseArgs(args) {
         positional.push(arg);
         break;
     }
+  }
+
+  // Round 4: --raw and --stream are mutually exclusive — --stream emits
+  // JSONL pass-through with no validation, --raw emits a single validated
+  // JSON object. Accepting both silently dropped --raw and led to scripts
+  // getting unvalidated JSONL when they expected validated JSON.
+  if (opts.raw && opts.stream) {
+    throw new Error('--raw and --stream cannot be used together.');
   }
 
   opts.query = positional.join(' ');
@@ -145,11 +160,48 @@ Examples:
 }
 
 function readStdin() {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let data = '';
     stdin.setEncoding('utf-8');
     stdin.on('data', (chunk) => { data += chunk; });
-    stdin.on('end', () => resolve(data.trim()));
+    stdin.once('end', () => resolve(data.trim()));
+    // Round 4: surface stdin read errors instead of leaving the promise
+    // unresolved. A controlled rejection lets main() print a clean error
+    // and trigger the normal cleanup path.
+    stdin.once('error', (err) => reject(err));
+  });
+}
+
+/**
+ * Round 4: terminate a child process gracefully (SIGTERM) and escalate to
+ * SIGKILL after `graceMs` if it is still alive. Resolves only after the
+ * child has actually exited (or was already dead) so callers cannot leak
+ * an orphan when they exit immediately afterwards.
+ */
+function terminateChild(child, { graceMs = 250 } = {}) {
+  return new Promise((resolve) => {
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(killTimer);
+      resolve();
+    };
+    child.once('close', finish);
+    try { child.kill('SIGTERM'); } catch { /* ignore */ }
+    const killTimer = setTimeout(() => {
+      try {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGKILL');
+        }
+      } catch { /* ignore */ }
+    }, graceMs);
+    // Don't keep the event loop alive solely for the kill timer.
+    killTimer.unref?.();
   });
 }
 
@@ -276,26 +328,26 @@ function runGeminiStreaming(query, systemSettingsPath, registerChild) {
     child.stderr.pipe(stderr, { end: false });
 
     // Swallow downstream pipe errors during streaming. EPIPE happens when the
-    // consumer (e.g. `head -3`) closes early — kill the child and resolve
-    // cleanly so finally-cleanup still runs.
+    // consumer (e.g. `head -3`) closes early — terminate the child gracefully
+    // (SIGTERM with SIGKILL fallback after 250ms) and only settle once the
+    // child has actually exited so we never leak an orphan.
     const onDownstreamError = (err) => {
-      if (err && err.code === 'EPIPE') {
-        try { child.kill('SIGTERM'); } catch { /* ignore */ }
-        clearTimeout(timer);
-        settle(resolve);
-        return;
-      }
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
       clearTimeout(timer);
-      settle(reject, err);
+      const isEpipe = err && err.code === 'EPIPE';
+      // Fire and forget: terminateChild() handles already-exited children.
+      terminateChild(child).then(() => {
+        if (isEpipe) settle(resolve);
+        else settle(reject, err);
+      });
     };
     stdout.on('error', onDownstreamError);
     stderr.on('error', onDownstreamError);
 
     const timeoutMs = getTimeout();
     const timer = setTimeout(() => {
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
-      settle(reject, new Error(`Gemini CLI timed out after ${timeoutMs}ms`));
+      terminateChild(child).then(() => {
+        settle(reject, new Error(`Gemini CLI timed out after ${timeoutMs}ms`));
+      });
     }, timeoutMs);
 
     child.on('error', (err) => {
@@ -497,36 +549,47 @@ async function main() {
   let signaled = false;
   let activeChild = null;
   const registerChild = (child) => { activeChild = child; };
-  const onSignal = (signal) => {
+  const SIGNAL_NUMBERS = { SIGINT: 2, SIGTERM: 15 };
+  const onSignal = async (signal) => {
     if (signaled) return;
     signaled = true;
-    // Kill the active gemini child first so it doesn't outlive the wrapper
-    // as an orphaned process. Try graceful, then SIGKILL fallback.
-    if (activeChild && activeChild.exitCode === null && activeChild.signalCode === null) {
-      try { activeChild.kill('SIGTERM'); } catch { /* ignore */ }
-      // Best-effort SIGKILL fallback after a short grace window.
-      setTimeout(() => {
-        try {
-          if (activeChild && activeChild.exitCode === null && activeChild.signalCode === null) {
-            activeChild.kill('SIGKILL');
-          }
-        } catch { /* ignore */ }
-      }, 250).unref?.();
-    }
+    // Round 4: actually wait for the gemini child to exit before tearing
+    // ourselves down. Previous version raised the signal on `process` while
+    // the SIGKILL fallback timer was still pending, so a child ignoring
+    // SIGTERM would survive the wrapper as an orphan.
+    try { await terminateChild(activeChild); } catch { /* ignore */ }
     try { cleanup(); } catch { /* ignore */ }
     process.removeListener('SIGINT', onSigint);
     process.removeListener('SIGTERM', onSigterm);
-    // Re-raise so exit code reflects the signal.
-    process.kill(process.pid, signal);
+    // Re-raise so exit code reflects the signal. If re-raising fails for
+    // any reason (e.g. the platform refuses SIGINT), fall back to setting
+    // the conventional 128+signum exit code so the wrapper never lingers.
+    try {
+      process.kill(process.pid, signal);
+    } catch {
+      process.exitCode = 128 + (SIGNAL_NUMBERS[signal] ?? 0);
+    }
   };
   // Store concrete wrapper references so removeListener actually removes
   // the same function objects later in `finally`.
-  const onSigint = () => onSignal('SIGINT');
-  const onSigterm = () => onSignal('SIGTERM');
+  const onSigint = () => { onSignal('SIGINT'); };
+  const onSigterm = () => { onSignal('SIGTERM'); };
   process.once('SIGINT', onSigint);
   process.once('SIGTERM', onSigterm);
 
-  const privacy = setupPrivacyOverride();
+  // Round 4: wrap the temp-dir setup in our own try so a failure in
+  // mkdtempSync()/writeFileSync() prints a clean error instead of a raw
+  // Node stack trace from an unhandled rejection in main().
+  let privacy;
+  try {
+    privacy = setupPrivacyOverride();
+  } catch (err) {
+    stderr.write(`Error: failed to create Gemini privacy override: ${extractErrorMessage(err)}\n`);
+    process.exitCode = 1;
+    process.removeListener('SIGINT', onSigint);
+    process.removeListener('SIGTERM', onSigterm);
+    return;
+  }
   cleanup = privacy.cleanup;
   const privacyPath = privacy.path;
 
