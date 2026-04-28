@@ -6,21 +6,27 @@ on:
       - master
       - main
 
+permissions: {}
+
 jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
+      # Minimum needed for semantic-release to push the tag, create a GitHub
+      # Release, and (if NPM_TOKEN is set) publish to npm via OIDC.
       contents: write
       issues: write
       pull-requests: write
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      # actions/setup-node@v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org/'
@@ -44,13 +50,16 @@ jobs:
             echo "::warning title=NPM_TOKEN not set::Skipping semantic-release. Set the NPM_TOKEN repository secret to enable npm publishing."
           fi
 
-      - name: Install semantic-release
+      - name: Install pinned semantic-release toolchain
         if: steps.npm_token.outputs.available == 'true'
-        run: npm install -g semantic-release @semantic-release/commit-analyzer @semantic-release/release-notes-generator @semantic-release/npm @semantic-release/exec @semantic-release/git @semantic-release/github conventional-changelog-conventionalcommits
+        # `npm ci` would require package-lock.json; we use `npm install` against
+        # the exact-pinned versions in devDependencies + the public npm registry,
+        # which mitigates the unpinned-toolchain supply-chain risk.
+        run: npm install --no-audit --no-fund --no-save --ignore-scripts
 
       - name: Release
         if: steps.npm_token.outputs.available == 'true'
-        run: semantic-release
+        run: npx --no-install semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

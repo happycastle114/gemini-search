@@ -215,15 +215,19 @@ function makeNotFoundError() {
 
 /**
  * Buffered execution for json / raw modes.
+ *
+ * `registerChild(child)` is called synchronously with the spawned ChildProcess
+ * so the caller can record it and kill it on SIGINT/SIGTERM, preventing
+ * orphaned `gemini` processes when the wrapper is interrupted.
  */
-function runGeminiBuffered(query, outputFormat, systemSettingsPath) {
+function runGeminiBuffered(query, outputFormat, systemSettingsPath, registerChild) {
   return new Promise((resolve, reject) => {
     const args = [
       '--output-format', outputFormat,
       '--prompt', buildPrompt(query),
     ];
 
-    execFile('gemini', args, {
+    const child = execFile('gemini', args, {
       timeout: getTimeout(),
       maxBuffer: getMaxBuffer(),
       env: buildEnv(systemSettingsPath),
@@ -239,13 +243,14 @@ function runGeminiBuffered(query, outputFormat, systemSettingsPath) {
       }
       resolve(out);
     });
+    registerChild?.(child);
   });
 }
 
 /**
  * True streaming for --stream mode. Pipes stdout/stderr live; no maxBuffer cap.
  */
-function runGeminiStreaming(query, systemSettingsPath) {
+function runGeminiStreaming(query, systemSettingsPath, registerChild) {
   return new Promise((resolve, reject) => {
     const args = [
       '--output-format', 'stream-json',
@@ -256,6 +261,7 @@ function runGeminiStreaming(query, systemSettingsPath) {
       env: buildEnv(systemSettingsPath),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    registerChild?.(child);
 
     let settled = false;
     const settle = (fn, value) => {
@@ -356,14 +362,42 @@ function formatLatency(ms) {
 //   [See here](url) do not satisfy the contract.
 // - The Sources heading MUST be exactly "## Sources" on its own line. Other
 //   levels (#, ###, etc.) and trailing decorations are rejected.
-const INLINE_CITATION_RE = /\[Source\]\(https?:\/\/[^\s)]+(?:\s+"[^"]*")?\)/;
+// - Citations inside fenced code blocks or inline code spans do NOT count —
+//   those are example/escaped artifacts, not real citations.
+// - Image syntax `![Source](url)` does NOT count.
+// - URLs must parse as valid http(s) URLs.
+const INLINE_CITATION_RE = /(?<!!)\[Source\]\((https?:\/\/[^\s)]+)(?:\s+"[^"]*")?\)/g;
 const SOURCES_SECTION_RE = /^## Sources\s*$/m;
+const FENCED_CODE_RE = /```[\s\S]*?```/g;
+const INLINE_CODE_RE = /`[^`\n]*`/g;
+
+function stripCode(markdown) {
+  return markdown
+    .replace(FENCED_CODE_RE, '')
+    .replace(INLINE_CODE_RE, '');
+}
+
+function hasValidInlineCitation(stripped) {
+  // Reset lastIndex defensively (shouldn't matter on a fresh exec, but the
+  // global flag makes this stateful per-regex-instance).
+  INLINE_CITATION_RE.lastIndex = 0;
+  let m;
+  while ((m = INLINE_CITATION_RE.exec(stripped)) !== null) {
+    const url = m[1];
+    try {
+      const u = new URL(url);
+      if (u.protocol === 'http:' || u.protocol === 'https:') return true;
+    } catch { /* not a valid URL — keep scanning */ }
+  }
+  return false;
+}
 
 function validateCitations(markdown) {
-  if (!INLINE_CITATION_RE.test(markdown)) {
-    throw new Error('Gemini response did not include any inline [Source](url) citations. Refusing to return uncited content.');
+  const stripped = stripCode(markdown);
+  if (!hasValidInlineCitation(stripped)) {
+    throw new Error('Gemini response did not include any inline [Source](url) citations with a valid http(s) URL outside of code blocks. Refusing to return uncited content.');
   }
-  if (!SOURCES_SECTION_RE.test(markdown)) {
+  if (!SOURCES_SECTION_RE.test(stripped)) {
     throw new Error('Gemini response did not include a "## Sources" section. Refusing to return uncited content.');
   }
 }
@@ -461,9 +495,24 @@ async function main() {
   // exit the process and leave a stray /tmp/gemini-search-priv-* behind.
   let cleanup = () => {};
   let signaled = false;
+  let activeChild = null;
+  const registerChild = (child) => { activeChild = child; };
   const onSignal = (signal) => {
     if (signaled) return;
     signaled = true;
+    // Kill the active gemini child first so it doesn't outlive the wrapper
+    // as an orphaned process. Try graceful, then SIGKILL fallback.
+    if (activeChild && activeChild.exitCode === null && activeChild.signalCode === null) {
+      try { activeChild.kill('SIGTERM'); } catch { /* ignore */ }
+      // Best-effort SIGKILL fallback after a short grace window.
+      setTimeout(() => {
+        try {
+          if (activeChild && activeChild.exitCode === null && activeChild.signalCode === null) {
+            activeChild.kill('SIGKILL');
+          }
+        } catch { /* ignore */ }
+      }, 250).unref?.();
+    }
     try { cleanup(); } catch { /* ignore */ }
     process.removeListener('SIGINT', onSigint);
     process.removeListener('SIGTERM', onSigterm);
@@ -498,11 +547,11 @@ async function main() {
   try {
     if (opts.stream) {
       // True streaming: live JSONL pass-through, no buffer cap.
-      await runGeminiStreaming(query, privacyPath);
+      await runGeminiStreaming(query, privacyPath, registerChild);
       return;
     }
 
-    const result = await runGeminiBuffered(query, 'json', privacyPath);
+    const result = await runGeminiBuffered(query, 'json', privacyPath, registerChild);
 
     // Even in --raw mode we MUST validate the JSON envelope: data.error,
     // empty response, malformed JSON, and missing citations are all

@@ -166,12 +166,12 @@ gemini-search/
 ## How It Works
 
 1. **Privacy override** — A per-invocation system-override settings file disables `privacy.usageStatisticsEnabled` without touching your global config or auth.
-2. **System prompt injection** — `gemini-search` wraps every query with a search-optimized prompt that forces Gemini to use `google_web_search` and **mandates inline `[Source](url)` citations** for every claim. The user query is fenced in a `<user_query>` block so prompt-injection attempts inside it cannot override the citation rule.
-3. **JSON parsing** — Uses `--output-format json` to get structured responses with token stats and grounding metadata. Malformed JSON or error payloads cause a non-zero exit rather than silent fall-through.
-4. **Citation enforcement** — The wrapper validates that the rendered markdown contains at least one inline `[Source](url)` link **and** a `Sources` section. Responses without both are rejected with a non-zero exit. The wrapper does not synthesize citations on its own.
-5. **True streaming** — `--stream` uses `spawn()` and pipes Gemini's `stream-json` output through stdout/stderr live, with no buffer cap.
+2. **System prompt + JSON-encoded query** — `gemini-search` wraps every query with a search-optimized prompt that forces Gemini to use `google_web_search` and **mandates inline `[Source](url)` citations** for every claim. The user query is embedded as a JSON-encoded string (`JSON.stringify(query)`), so any quotes, backticks, angle-brackets, or pseudo-tags inside the query cannot escape the prompt boundary and inject new instructions.
+3. **JSON parsing + raw validation** — Uses `--output-format json` to get structured responses with token stats and grounding metadata. Malformed JSON, `data.error` payloads, empty responses, and missing citations are all rejected with a non-zero exit. `--raw` validates identically before emitting the raw envelope.
+4. **Citation enforcement** — The wrapper validates that the rendered markdown contains at least one literal inline `[Source](url)` link **with a valid http(s) URL outside of code blocks** AND a `## Sources` heading on its own line. Image syntax `![Source](url)` and citations inside fenced/inline code spans do not count. Responses without both real citations and the heading are rejected. The wrapper never synthesizes citations on its own.
+5. **True streaming** — `--stream` uses `spawn()` and pipes Gemini's `stream-json` output through stdout/stderr live, with no buffer cap. Downstream `EPIPE` (e.g. `... | head -3`) is treated as a clean exit.
 6. **No model flag** — Gemini CLI's built-in routing picks the right model. Override via `~/.gemini/settings.json` if needed.
-7. **Cleanup-safe** — Temp privacy override directory is removed in normal exit, error exit, and on `SIGINT`/`SIGTERM`.
+7. **Cleanup-safe** — Signal handlers are registered before the temp dir is created. On `SIGINT`/`SIGTERM` the wrapper kills the active `gemini` child (with a `SIGKILL` fallback after a short grace window so it never orphans), removes the temp privacy-override directory, and re-raises the signal so the parent shell sees the correct exit status.
 
 ## Development
 
