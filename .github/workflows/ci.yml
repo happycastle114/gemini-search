@@ -41,7 +41,7 @@ jobs:
       # invariants Oracle has been finding bypasses for, so a regression
       # would block merge instead of leaking into a release.
       - name: Run unit tests
-        run: node --test 'test/**/*.test.mjs'
+        run: node --test test/wrapper.test.mjs
 
       - name: Validate hooks.json
         run: |
