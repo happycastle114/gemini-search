@@ -31,10 +31,25 @@ jobs:
           node --check bin/gemini-search.mjs
           echo "Validation passed"
 
+      - name: Check NPM_TOKEN availability
+        id: npm_token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "${NPM_TOKEN}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "NPM_TOKEN is set; semantic-release will publish to npm."
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=NPM_TOKEN not set::Skipping semantic-release. Set the NPM_TOKEN repository secret to enable npm publishing."
+          fi
+
       - name: Install semantic-release
+        if: steps.npm_token.outputs.available == 'true'
         run: npm install -g semantic-release @semantic-release/commit-analyzer @semantic-release/release-notes-generator @semantic-release/npm @semantic-release/exec @semantic-release/git @semantic-release/github conventional-changelog-conventionalcommits
 
       - name: Release
+        if: steps.npm_token.outputs.available == 'true'
         run: semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
