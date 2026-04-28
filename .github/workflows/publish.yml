@@ -52,10 +52,11 @@ jobs:
 
       - name: Install pinned semantic-release toolchain
         if: steps.npm_token.outputs.available == 'true'
-        # `npm ci` would require package-lock.json; we use `npm install` against
-        # the exact-pinned versions in devDependencies + the public npm registry,
-        # which mitigates the unpinned-toolchain supply-chain risk.
-        run: npm install --no-audit --no-fund --no-save --ignore-scripts
+        # Round 5: package-lock.json is committed and `npm ci` is used so the
+        # entire transitive dependency graph is reproducible across releases,
+        # not just the direct devDependencies. --ignore-scripts blocks npm
+        # lifecycle scripts from any (transitive) dep on the publish path.
+        run: npm ci --no-audit --no-fund --ignore-scripts
 
       - name: Release
         if: steps.npm_token.outputs.available == 'true'

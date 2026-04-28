@@ -279,23 +279,45 @@ function runGeminiBuffered(query, outputFormat, systemSettingsPath, registerChil
       '--prompt', buildPrompt(query),
     ];
 
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+
+    // Round 5: do NOT use execFile's built-in `timeout` option. Node's
+    // implementation only sends SIGTERM and waits for the child to exit —
+    // a child that traps/ignores SIGTERM will never resolve the callback,
+    // so the wrapper hangs past GEMINI_SEARCH_TIMEOUT. Instead we manage
+    // our own timer and route through terminateChild() (SIGTERM, then
+    // SIGKILL after a 250ms grace) so the buffered path has the same
+    // hard-kill guarantee as the streaming path.
     const child = execFile('gemini', args, {
-      timeout: getTimeout(),
       maxBuffer: getMaxBuffer(),
       env: buildEnv(systemSettingsPath),
     }, (error, out, err) => {
       if (error) {
         if (error.code === 'ENOENT') {
-          reject(makeNotFoundError());
+          settle(reject, makeNotFoundError());
           return;
         }
         const msg = err?.trim() || error.message || 'Gemini CLI execution failed';
-        reject(new Error(msg));
+        settle(reject, new Error(msg));
         return;
       }
-      resolve(out);
+      settle(resolve, out);
     });
     registerChild?.(child);
+
+    const timeoutMs = getTimeout();
+    const timer = setTimeout(() => {
+      terminateChild(child).then(() => {
+        settle(reject, new Error(`Gemini CLI timed out after ${timeoutMs}ms`));
+      });
+    }, timeoutMs);
+    timer.unref?.();
   });
 }
 
@@ -420,13 +442,70 @@ function formatLatency(ms) {
 // - URLs must parse as valid http(s) URLs.
 const INLINE_CITATION_RE = /(?<!!)\[Source\]\((https?:\/\/[^\s)]+)(?:\s+"[^"]*")?\)/g;
 const SOURCES_SECTION_RE = /^## Sources\s*$/m;
-const FENCED_CODE_RE = /```[\s\S]*?```/g;
-const INLINE_CODE_RE = /`[^`\n]*`/g;
 
+// Round 5: regex-based code stripping does not handle (a) unclosed fenced
+// blocks (the trailing ``` at EOF is missing — model render still treats
+// the rest as code), or (b) multi-backtick inline spans like ``foo``. We
+// scan the markdown line-by-line tracking fenced state explicitly, and
+// remove every inline-code span by repeatedly finding matched runs of N
+// backticks (N >= 1).
 function stripCode(markdown) {
-  return markdown
-    .replace(FENCED_CODE_RE, '')
-    .replace(INLINE_CODE_RE, '');
+  const lines = markdown.split('\n');
+  const out = [];
+  let inFence = false;
+  let fenceMarker = '';
+  for (const line of lines) {
+    const trimmed = line.replace(/^\s+/, '');
+    // CommonMark fence opener / closer: 3+ backticks or 3+ tildes at the
+    // start of a line (allowing leading whitespace). A closer must use the
+    // same marker char as the opener and have at least as many chars. An
+    // unclosed opener swallows everything to EOF — exactly what a markdown
+    // renderer does — so citations after it must NOT be counted.
+    const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmed);
+    if (fenceMatch) {
+      const marker = fenceMatch[1];
+      if (!inFence) {
+        inFence = true;
+        fenceMarker = marker[0].repeat(marker.length);
+        continue;
+      }
+      if (marker[0] === fenceMarker[0] && marker.length >= fenceMarker.length) {
+        inFence = false;
+        fenceMarker = '';
+        continue;
+      }
+    }
+    if (inFence) continue;
+    out.push(stripInlineCode(line));
+  }
+  return out.join('\n');
+}
+
+// Round 5: handle multi-backtick inline code (CommonMark): a run of N
+// backticks opens a span that closes at the next run of exactly N
+// backticks. Repeatedly strip the longest-first matched runs.
+function stripInlineCode(line) {
+  let result = '';
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] !== '`') {
+      result += line[i++];
+      continue;
+    }
+    let n = 0;
+    while (i + n < line.length && line[i + n] === '`') n++;
+    const open = '`'.repeat(n);
+    const closeIdx = line.indexOf(open, i + n);
+    if (closeIdx === -1) {
+      // No matching closer on this line — treat as literal text.
+      result += line.slice(i, i + n);
+      i += n;
+      continue;
+    }
+    // Skip the entire span including delimiters.
+    i = closeIdx + n;
+  }
+  return result;
 }
 
 function hasValidInlineCitation(stripped) {
