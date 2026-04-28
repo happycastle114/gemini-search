@@ -142,6 +142,38 @@ function runGemini(query, model, outputFormat) {
   });
 }
 
+function aggregateStats(stats) {
+  // Gemini CLI stats shape: { models: { <modelName>: { api: { totalLatencyMs }, tokens: { total, input, candidates } } } }
+  const models = stats?.models;
+  if (!models || typeof models !== 'object') return null;
+
+  let totalTokens = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let totalLatencyMs = 0;
+  const modelNames = [];
+
+  for (const [name, info] of Object.entries(models)) {
+    modelNames.push(name);
+    const tokens = info?.tokens || {};
+    const api = info?.api || {};
+    totalTokens += Number(tokens.total) || 0;
+    inputTokens += Number(tokens.input) || 0;
+    outputTokens += Number(tokens.candidates) || 0;
+    totalLatencyMs += Number(api.totalLatencyMs) || 0;
+  }
+
+  if (totalTokens === 0 && totalLatencyMs === 0) return null;
+
+  return { totalTokens, inputTokens, outputTokens, totalLatencyMs, modelNames };
+}
+
+function formatLatency(ms) {
+  if (!ms) return '';
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
 function formatResponse(jsonStr) {
   try {
     const data = JSON.parse(jsonStr);
@@ -151,18 +183,18 @@ function formatResponse(jsonStr) {
     }
 
     const response = data.response || '';
-    const stats = data.stats || {};
-
     let output = response;
 
     // Append stats footer if available
-    if (stats.totalTokens || stats.totalDuration) {
+    const agg = aggregateStats(data.stats);
+    if (agg) {
       output += '\n\n---\n';
       const parts = [];
-      if (stats.totalTokens) parts.push(`Tokens: ${stats.totalTokens}`);
-      if (stats.inputTokens) parts.push(`Input: ${stats.inputTokens}`);
-      if (stats.outputTokens) parts.push(`Output: ${stats.outputTokens}`);
-      if (stats.totalDuration) parts.push(`Duration: ${stats.totalDuration}`);
+      if (agg.modelNames.length) parts.push(`Model: ${agg.modelNames.join(', ')}`);
+      if (agg.totalTokens) parts.push(`Tokens: ${agg.totalTokens.toLocaleString()}`);
+      if (agg.inputTokens) parts.push(`In: ${agg.inputTokens.toLocaleString()}`);
+      if (agg.outputTokens) parts.push(`Out: ${agg.outputTokens.toLocaleString()}`);
+      if (agg.totalLatencyMs) parts.push(`Latency: ${formatLatency(agg.totalLatencyMs)}`);
       output += `*${parts.join(' | ')}*`;
     }
 
