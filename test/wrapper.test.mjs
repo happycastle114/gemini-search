@@ -416,3 +416,36 @@ test('main: rejects oversize prompt bytes (R9 multi-byte path)', async (t) => {
   assert.equal(code, 1, 'oversize prompt-bytes must exit 1');
   assert.match(stderrBuf, /max is 8/);
 });
+
+// ============================================================
+// Round 10 regressions
+// ============================================================
+
+test('stripTerminalControls: DCS/APC/PM/SOS string controls fully removed (R10 ECMA-48 §5.6)', () => {
+  // ECMA-48 §5.6 defines five string-mode controls. R9 only stripped OSC;
+  // R10 unifies all five into a single regex. Each must drop its entire
+  // payload (introducer + content + ST/BEL terminator), not just the
+  // 2-byte introducer.
+  // DCS: ESC P ... ESC \
+  assert.equal(stripTerminalControls('a\x1bP1;evil\x1b\\b'), 'ab', 'DCS payload must be stripped');
+  // APC: ESC _ ... ESC \
+  assert.equal(stripTerminalControls('a\x1b_payload\x1b\\b'), 'ab', 'APC payload must be stripped');
+  // PM:  ESC ^ ... ESC \
+  assert.equal(stripTerminalControls('a\x1b^msg\x1b\\b'), 'ab', 'PM payload must be stripped');
+  // SOS: ESC X ... ESC \
+  assert.equal(stripTerminalControls('a\x1bXmsg\x1b\\b'), 'ab', 'SOS payload must be stripped');
+  // OSC still works (BEL terminator)
+  assert.equal(stripTerminalControls('a\x1b]0;hijack\x07b'), 'ab', 'OSC with BEL still stripped');
+  // OSC still works (ST terminator)
+  assert.equal(stripTerminalControls('a\x1b]2;t\x1b\\b'), 'ab', 'OSC with ST still stripped');
+});
+
+test('package.json: declares engines.node >=18 (R10 install-time gate)', async () => {
+  const here = fileURLToPath(import.meta.url);
+  const pkgPath = resolve(here, '..', '..', 'package.json');
+  const { readFileSync } = await import('node:fs');
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+  assert.ok(pkg.engines, 'package.json must declare engines');
+  assert.ok(pkg.engines.node, 'package.json must declare engines.node');
+  assert.match(pkg.engines.node, /^>=\s*1[8-9]|^>=\s*[2-9]\d/, 'engines.node must require >=18');
+});

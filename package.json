@@ -25,6 +25,9 @@
     "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "test": "node --test test/wrapper.test.mjs",
     "lint": "node --check bin/gemini-search.mjs",
