@@ -123,7 +123,7 @@ Always structure final research output as:
 - [Actionable recommendation 1]
 - [Actionable recommendation 2]
 
-### Sources
+## Sources
 - [Source 1](url) — [brief description]
 - [Source 2](url) — [brief description]
 ```

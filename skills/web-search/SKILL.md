@@ -31,34 +31,17 @@ The script automatically:
 2. Forces Gemini to use `google_web_search` for grounding
 3. Parses the JSON response and formats clean markdown with citations
 
-## Direct Gemini CLI Usage
+## Always Use The Wrapper
 
-If you prefer calling Gemini CLI directly:
+Always invoke web search through `gemini-search`. **Do not call `gemini` directly.** The wrapper provides:
 
-```bash
-gemini --output-format json --prompt "Search the web: What is the latest stable version of React?"
-```
+- Per-invocation privacy override (`privacy.usageStatisticsEnabled=false`) without touching `~/.gemini/settings.json`
+- Mandatory inline `[Source](url)` citation enforcement and `## Sources` heading validation — direct `gemini` calls have no such guarantee
+- Prompt-injection fencing for the user query
+- Hardened timeout / buffer defaults and friendly ENOENT error
+- Cleanup-safe temp dir on success, error, and SIGINT/SIGTERM
 
-### Parse the JSON response
-
-The `--output-format json` flag returns:
-```json
-{
-  "session_id": "...",
-  "response": "The latest stable version of React is 19.1...",
-  "stats": {
-    "totalTokens": 1234,
-    "inputTokens": 100,
-    "outputTokens": 1134,
-    "totalDuration": "3.2s"
-  }
-}
-```
-
-Extract just the response text:
-```bash
-gemini --output-format json --prompt "query" | jq -r '.response'
-```
+Direct `gemini --output-format json --prompt ...` invocation bypasses all of the above and must not be used from Claude Code workflows.
 
 ## Search Prompt Patterns
 

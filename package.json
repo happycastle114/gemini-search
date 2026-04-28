@@ -9,6 +9,9 @@
     "type": "git",
     "url": "https://github.com/happycastle114/gemini-search.git"
   },
+  "bin": {
+    "gemini-search": "./bin/gemini-search.mjs"
+  },
   "files": [
     ".claude-plugin",
     "skills",
