@@ -14,7 +14,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   stripCode,
-  stripInlineCode,
+  stripInlineCodeSpans,
   hasValidInlineCitation,
   validateCitations,
   parseAndValidate,
@@ -81,20 +81,20 @@ test('stripCode: paragraph continuation NOT treated as indented code', () => {
   assert.match(out, /https:\/\/x\.com/);
 });
 
-test('stripInlineCode: single-backtick span stripped', () => {
-  assert.equal(stripInlineCode('foo `[Source](http://x)` bar'), 'foo  bar');
+test('stripInlineCodeSpans: single-backtick span stripped', () => {
+  assert.equal(stripInlineCodeSpans('foo `[Source](http://x)` bar'), 'foo  bar');
 });
 
-test('stripInlineCode: double-backtick span stripped', () => {
-  assert.equal(stripInlineCode('foo ``[Source](http://x)`` bar'), 'foo  bar');
+test('stripInlineCodeSpans: double-backtick span stripped', () => {
+  assert.equal(stripInlineCodeSpans('foo ``[Source](http://x)`` bar'), 'foo  bar');
 });
 
-test('stripInlineCode: triple-backtick inline span stripped', () => {
-  assert.equal(stripInlineCode('foo ```x``y``` bar'), 'foo  bar');
+test('stripInlineCodeSpans: triple-backtick inline span stripped', () => {
+  assert.equal(stripInlineCodeSpans('foo ```x``y``` bar'), 'foo  bar');
 });
 
-test('stripInlineCode: unbalanced backticks preserved as literal', () => {
-  assert.equal(stripInlineCode('foo `[Source](http://x) bar'), 'foo `[Source](http://x) bar');
+test('stripInlineCodeSpans: unbalanced backticks preserved as literal', () => {
+  assert.equal(stripInlineCodeSpans('foo `[Source](http://x) bar'), 'foo `[Source](http://x) bar');
 });
 
 test('hasValidInlineCitation: rejects non-http(s) URLs', () => {
@@ -280,11 +280,24 @@ test('validateCitations: rejects <script>-hidden citation (R7)', () => {
 });
 
 test('CLI: --help works through a symlink (R7 entry-point gate)', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('Symlink creation requires elevated privileges on Windows');
+    return;
+  }
   const here = fileURLToPath(import.meta.url);
   const realBin = resolve(here, '..', '..', 'bin', 'gemini-search.mjs');
   const dir = mkdtempSync(join(tmpdir(), 'gs-symlink-'));
   const link = join(dir, 'gemini-search-symlink.mjs');
-  symlinkSync(realBin, link);
+  try {
+    symlinkSync(realBin, link);
+  } catch (err) {
+    if (err && (err.code === 'EPERM' || err.code === 'EACCES')) {
+      t.skip(`Symlink creation denied: ${err.code}`);
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      return;
+    }
+    throw err;
+  }
   t.after(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
   const child = spawn(process.execPath, [link, '--help']);
   let stdout = '';
@@ -292,4 +305,52 @@ test('CLI: --help works through a symlink (R7 entry-point gate)', async (t) => {
   const code = await new Promise((resolve) => child.once('close', resolve));
   assert.equal(code, 0, `symlinked CLI --help must exit 0 (got ${code})`);
   assert.match(stdout, /gemini-search/, 'symlinked CLI --help must print usage');
+});
+
+test('stripCode: invalid fence-closer keeps code block open (R8)', () => {
+  const md = [
+    '```',
+    'inside code',
+    '``` not actually a closer',
+    '[Source](https://hidden.example)',
+    '```',
+    '[Source](https://real.example)',
+    '## Sources',
+  ].join('\n');
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /hidden\.example/, 'citation inside still-open fence must be stripped');
+  assert.match(out, /real\.example/, 'real citation outside fence must survive');
+});
+
+test('stripCode: type-1 HTML closer line is fully consumed (R8)', () => {
+  const md = '<pre>\nhidden\n</pre> [Source](https://x.example)\n[Source](https://y.example)\n## Sources';
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /x\.example/, 'citation on the </pre> line must be consumed');
+  assert.match(out, /y\.example/, 'real citation on next line must survive');
+});
+
+test('stripCode: type-6 HTML block with quoted > in attribute (R8)', () => {
+  const md = '<div title="a>b">\n[Source](https://hidden.example)\n</div>\n\n[Source](https://real.example)\n## Sources';
+  const out = stripCode(md);
+  assert.doesNotMatch(out, /hidden\.example/, 'attribute-quoted > must not break block detection');
+  assert.match(out, /real\.example/);
+});
+
+test('stripCode: unclosed <pre> inside fenced block does not swallow real citations (R8)', () => {
+  const md = '```\n<pre>\nstuff\n```\n[Source](https://real.example)\n## Sources';
+  const out = stripCode(md);
+  assert.match(out, /real\.example/, 'fenced code is stripped first; <pre> inside it is inert');
+});
+
+test('main: rejects oversize query (R8)', async (t) => {
+  const here = fileURLToPath(import.meta.url);
+  const realBin = resolve(here, '..', '..', 'bin', 'gemini-search.mjs');
+  const child = spawn(process.execPath, [realBin, 'x'.repeat(40000)], {
+    env: { ...process.env, GEMINI_SEARCH_MAX_QUERY_CHARS: '32768' },
+  });
+  let stderrBuf = '';
+  child.stderr.on('data', (b) => { stderrBuf += b.toString(); });
+  const code = await new Promise((resolve) => child.once('close', resolve));
+  assert.equal(code, 1, 'oversize query must exit 1');
+  assert.match(stderrBuf, /max is 32768/);
 });

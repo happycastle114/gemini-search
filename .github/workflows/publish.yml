@@ -26,9 +26,12 @@ jobs:
           persist-credentials: false
 
       # actions/setup-node@v4.4.0
+      # Round 8: semantic-release 25.x requires Node ^22.14 || >=24.10.
+      # Pinning to 22.14 (current LTS line head) keeps the release runtime
+      # within the supported engine range.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: '20'
+          node-version: '22.14'
           registry-url: 'https://registry.npmjs.org/'
 
       - name: Validate plugin

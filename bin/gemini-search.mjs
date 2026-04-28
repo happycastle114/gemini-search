@@ -35,6 +35,11 @@ import { argv, stdin, stdout, stderr } from 'node:process';
 
 const DEFAULT_TIMEOUT_MS = 600_000; // 10 min — research workflows can be long
 const DEFAULT_MAX_BUFFER = 50 * 1024 * 1024; // 50 MB
+// Round 8: cap query length so a runaway prompt cannot blow the OS argv
+// limit (Linux ARG_MAX is typically 128 KiB; macOS ~256 KiB) or hide a
+// pathological resource request from operators. 32 KiB leaves ample
+// headroom for the system prompt and JSON envelope on every platform.
+const DEFAULT_MAX_QUERY_CHARS = 32_768;
 
 // Search-optimized system prompt that forces web grounding + citations
 const SEARCH_SYSTEM_PROMPT = `You are a web search assistant. Your ONLY job is to search the web and return accurate, current information.
@@ -137,13 +142,16 @@ Usage:
 
 Options:
   -r, --raw             Output raw JSON instead of formatted markdown
-  -s, --stream          Use stream-json output format (JSONL events, real-time pass-through)
+  -s, --stream          Stream JSONL events live. Citation contract is NOT
+                        enforced in this mode (raw pass-through only).
+                        Prefer the default mode for source-verified answers.
       --stdin           Read query from stdin
   -h, --help            Show this help
 
 Environment:
-  GEMINI_SEARCH_TIMEOUT       Timeout in ms (default: ${DEFAULT_TIMEOUT_MS})
-  GEMINI_SEARCH_MAX_BUFFER    Max stdout buffer in bytes for non-stream modes (default: ${DEFAULT_MAX_BUFFER})
+  GEMINI_SEARCH_TIMEOUT          Timeout in ms (default: ${DEFAULT_TIMEOUT_MS})
+  GEMINI_SEARCH_MAX_BUFFER       Max stdout buffer in bytes for non-stream modes (default: ${DEFAULT_MAX_BUFFER})
+  GEMINI_SEARCH_MAX_QUERY_CHARS  Max query length in chars (default: ${DEFAULT_MAX_QUERY_CHARS})
 
 Privacy:
   Every invocation auto-disables Gemini CLI usage statistics via a temporary
@@ -475,20 +483,45 @@ const SOURCES_SECTION_RE = /^## Sources\s*$/m;
 //
 // CRLF / leading BOM are normalized at function entry.
 function stripCode(markdown) {
+  // Round 8: strip Markdown fenced/indented code BEFORE HTML blocks so an
+  // unclosed `<pre>` inside a fenced code block cannot swallow citations
+  // that appear after the fence in real prose.
   const normalized = markdown.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
-  const passA = stripHtmlBlocks(normalized);
-  const passB = stripMarkdownCodeBlocks(passA);
-  const passC = stripInlineCodeSpans(passB);
-  return passC;
+  const afterCode = stripMarkdownCodeBlocks(normalized);
+  const afterHtml = stripHtmlBlocks(afterCode);
+  const afterInline = stripInlineCodeSpans(afterHtml);
+  return afterInline;
 }
 
 const HTML_TYPE1_TAGS = ['pre', 'script', 'style', 'textarea'];
 
 function stripHtmlBlocks(input) {
+  // Round 8 (CommonMark §4.6, type 1): the entire LINE containing the
+  // matching close tag is part of the block, not just up to the close
+  // token. Scan line-by-line, drop every line from the opener line through
+  // the line containing the closer (inclusive). Unclosed → drop to EOF.
   let s = input;
   for (const tag of HTML_TYPE1_TAGS) {
-    const re = new RegExp(`<${tag}\\b[\\s\\S]*?(?:<\\/${tag}\\s*>|$)`, 'gi');
-    s = s.replace(re, '');
+    const openRe = new RegExp(`<${tag}\\b`, 'i');
+    const closeRe = new RegExp(`<\\/${tag}\\s*>`, 'i');
+    const lines = s.split('\n');
+    const kept = [];
+    let inBlock = false;
+    for (const line of lines) {
+      if (inBlock) {
+        if (closeRe.test(line)) inBlock = false;
+        continue;
+      }
+      if (openRe.test(line)) {
+        if (closeRe.test(line.replace(openRe, ''))) {
+          continue;
+        }
+        inBlock = true;
+        continue;
+      }
+      kept.push(line);
+    }
+    s = kept.join('\n');
   }
   s = s
     .replace(/<!--[\s\S]*?(?:-->|$)/g, '')
@@ -496,13 +529,62 @@ function stripHtmlBlocks(input) {
     .replace(/<!\[CDATA\[[\s\S]*?(?:\]\]>|$)/g, '')
     .replace(/<![A-Z][\s\S]*?(?:>|$)/g, '')
     .replace(/<code\b[\s\S]*?(?:<\/code\s*>|$)/gi, '');
-  const blockTags = '(?:address|article|aside|blockquote|body|center|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)';
-  const blockRe = new RegExp(
-    `(^|\\n)([ ]{0,3}<\\/?${blockTags}(?:\\s[^>]*|\\/?)>\\s*)(?=\\n|$)([\\s\\S]*?)(\\n[ \\t]*\\n|$)`,
-    'gi',
-  );
-  s = s.replace(blockRe, (_m, lead, _open, _body, term) => `${lead}${term}`);
+  // Round 8: attribute values may contain raw '>' inside quotes (e.g.
+  // `<div title="a>b">`). The previous attribute-greedy regex stopped at
+  // the first '>' and could leave block content visible. Scan line-by-line
+  // and parse the open tag with quote awareness so quoted '>' is consumed.
+  s = stripHtmlBlockType6(s);
   return s;
+}
+
+const HTML_BLOCK_TAGS = new Set([
+  'address','article','aside','blockquote','body','center','details','dialog',
+  'dir','div','dl','dt','fieldset','figcaption','figure','footer','form','frame',
+  'frameset','h1','h2','h3','h4','h5','h6','head','header','hr','html','iframe',
+  'legend','li','link','main','menu','menuitem','nav','noframes','ol','optgroup',
+  'option','p','param','section','source','summary','table','tbody','td','tfoot',
+  'th','thead','title','tr','track','ul',
+]);
+
+function isHtmlBlockType6Opener(line) {
+  const m = /^[ ]{0,3}<(\/)?([a-zA-Z][a-zA-Z0-9-]*)/.exec(line);
+  if (!m) return false;
+  const tagName = m[2].toLowerCase();
+  if (!HTML_BLOCK_TAGS.has(tagName)) return false;
+  let i = m.index + m[0].length;
+  let inSingle = false;
+  let inDouble = false;
+  while (i < line.length) {
+    const c = line[i];
+    if (inSingle) { if (c === "'") inSingle = false; i++; continue; }
+    if (inDouble) { if (c === '"') inDouble = false; i++; continue; }
+    if (c === "'") { inSingle = true; i++; continue; }
+    if (c === '"') { inDouble = true; i++; continue; }
+    if (c === '>') return true;
+    i++;
+  }
+  return inSingle || inDouble ? false : true;
+}
+
+function stripHtmlBlockType6(input) {
+  const lines = input.split('\n');
+  const out = [];
+  let inBlock = false;
+  for (const line of lines) {
+    if (inBlock) {
+      if (line.trim() === '') {
+        inBlock = false;
+        out.push(line);
+      }
+      continue;
+    }
+    if (isHtmlBlockType6Opener(line)) {
+      inBlock = true;
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join('\n');
 }
 
 function stripMarkdownCodeBlocks(input) {
@@ -515,25 +597,30 @@ function stripMarkdownCodeBlocks(input) {
   for (const rawLine of lines) {
     const line = stripBlockquotePrefix(rawLine);
     const trimmed = line.replace(/^[ \t]+/, '');
-    const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmed);
-    if (fenceMatch) {
-      const marker = fenceMatch[1];
-      if (!inFence) {
-        inFence = true;
-        fenceMarkerChar = marker[0];
-        fenceMarkerLen = marker.length;
-        prevBlank = false;
-        continue;
-      }
-      if (marker[0] === fenceMarkerChar && marker.length >= fenceMarkerLen) {
+    if (inFence) {
+      // Round 8 (CommonMark §4.5): a closing fence is a sequence of the
+      // SAME marker char (>= opener length) followed only by spaces/tabs
+      // until end of line. Anything else (e.g. "``` not a closer") keeps
+      // the block open. Without this strict check, adversarial info text
+      // on a closing fence line could prematurely terminate the block and
+      // leak a hidden citation inside the still-open code region.
+      const closerRe = new RegExp(`^${fenceMarkerChar === '`' ? '`' : '~'}{${fenceMarkerLen},}[ \\t]*$`);
+      if (closerRe.test(trimmed)) {
         inFence = false;
         fenceMarkerChar = '';
         fenceMarkerLen = 0;
         prevBlank = false;
         continue;
       }
+      prevBlank = false;
+      continue;
     }
-    if (inFence) {
+    const openMatch = /^(`{3,}|~{3,})/.exec(trimmed);
+    if (openMatch) {
+      const marker = openMatch[1];
+      inFence = true;
+      fenceMarkerChar = marker[0];
+      fenceMarkerLen = marker.length;
       prevBlank = false;
       continue;
     }
@@ -585,10 +672,6 @@ function stripInlineCodeSpans(input) {
     i = closeIdx + n;
   }
   return result;
-}
-
-function stripInlineCode(line) {
-  return stripInlineCodeSpans(line);
 }
 
 function hasValidInlineCitation(stripped) {
@@ -704,6 +787,19 @@ async function main() {
     return;
   }
 
+  const maxQueryChars = (() => {
+    const v = Number(process.env.GEMINI_SEARCH_MAX_QUERY_CHARS);
+    return Number.isFinite(v) && v > 0 ? v : DEFAULT_MAX_QUERY_CHARS;
+  })();
+  if (query.length > maxQueryChars) {
+    stderr.write(
+      `Error: query is ${query.length} chars; max is ${maxQueryChars}. ` +
+      `Set GEMINI_SEARCH_MAX_QUERY_CHARS to override.\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   // Register signal handlers BEFORE creating the temp dir so a signal
   // arriving in the window between mkdtemp() and handler registration cannot
   // exit the process and leave a stray /tmp/gemini-search-priv-* behind.
@@ -771,7 +867,12 @@ async function main() {
 
   try {
     if (opts.stream) {
-      // True streaming: live JSONL pass-through, no buffer cap.
+      try {
+        stderr.write(
+          'warning: --stream emits raw JSONL with no citation validation. ' +
+          'Use the default mode for source-verified answers.\n',
+        );
+      } catch { /* EPIPE on stderr — ignore */ }
       await runGeminiStreaming(query, privacyPath, registerChild);
       return;
     }
@@ -845,7 +946,7 @@ if (__isMain) {
 // explicit ESM import names them.
 export {
   stripCode,
-  stripInlineCode,
+  stripInlineCodeSpans,
   hasValidInlineCitation,
   validateCitations,
   parseAndValidate,
