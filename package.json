@@ -1,6 +1,6 @@
 {
   "name": "@happycastle/gemini-search",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Web search plugin for Claude Code — Gemini CLI with Google Search grounding, JSON parsing, and source citations",
   "type": "module",
   "license": "MIT",
