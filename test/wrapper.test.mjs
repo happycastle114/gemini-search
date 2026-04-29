@@ -509,3 +509,78 @@ test('buildPrompt: neutralizes injected fake system markers in query', () => {
   // The escaped newlines (\n inside the JSON string) keep injection contained.
   assert.ok(tail.includes('\\n'), 'newlines in the user query must be JSON-escaped');
 });
+
+// Oracle R2-005: JSON.stringify leaves U+2028/U+2029/bidi-override controls
+// verbatim; buildPrompt must additionally \uXXXX-escape them so they cannot
+// visually break out of the quoted user-query boundary.
+test('buildPrompt: escapes Unicode line separators U+2028/U+2029 (R2-005)', () => {
+  const p = buildPrompt('a\u2028b\u2029c');
+  assert.ok(!p.includes('\u2028'), 'U+2028 must be escaped');
+  assert.ok(!p.includes('\u2029'), 'U+2029 must be escaped');
+  assert.match(p, /\\u2028/);
+  assert.match(p, /\\u2029/);
+});
+
+test('buildPrompt: escapes bidi override controls U+202A-202E and U+2066-2069 (R2-005)', () => {
+  const bidi = '\u202E\u202D\u2066\u2069';
+  const p = buildPrompt(`x${bidi}y`);
+  for (const ch of bidi) {
+    assert.ok(!p.includes(ch), `${ch.codePointAt(0)?.toString(16)} must be escaped`);
+  }
+  assert.match(p, /\\u202e/);
+  assert.match(p, /\\u2069/);
+});
+
+// Oracle R2-002: prompt rule 6 mandates literal NO_RESULTS on zero hits.
+// parseAndValidate must short-circuit and return the data unmodified
+// without invoking validateCitations (which would otherwise reject a
+// response lacking `## Sources`).
+test('parseAndValidate: NO_RESULTS bypasses citation contract (R2-002)', () => {
+  const data = parseAndValidate('{"response":"NO_RESULTS"}');
+  assert.equal(data.response, 'NO_RESULTS');
+});
+
+test('parseAndValidate: NO_RESULTS with surrounding whitespace also bypasses (R2-002)', () => {
+  const data = parseAndValidate('{"response":"  NO_RESULTS  \\n"}');
+  assert.equal(typeof data.response, 'string');
+});
+
+// Oracle R2-003: validator must reject responses that cite forbidden
+// placeholder hosts even if the structural contract is satisfied.
+test('validateCitations: rejects example.com placeholder host (R2-003)', () => {
+  const bad = 'Foo is real. [Source](https://example.com/foo)\n\n## Sources\n1. https://example.com/foo\n';
+  assert.throws(() => validateCitations(bad), /forbidden|placeholder/i);
+});
+
+test('validateCitations: rejects foo.com placeholder host (R2-003)', () => {
+  const bad = 'Bar happened. [Source](https://foo.com/x)\n\n## Sources\n1. https://foo.com/x\n';
+  assert.throws(() => validateCitations(bad), /forbidden|placeholder/i);
+});
+
+test('validateCitations: rejects URL containing PLACEHOLDER token (R2-003)', () => {
+  const bad = 'Y is Z. [Source](https://news.example.test/PLACEHOLDER/article)\n\n## Sources\n1. https://news.example.test/PLACEHOLDER/article\n';
+  assert.throws(() => validateCitations(bad), /placeholder|PLACEHOLDER/i);
+});
+
+test('validateCitations: rejects URL containing TODO token (R2-003)', () => {
+  const bad = 'Y is Z. [Source](https://news.example.test/TODO/article)\n\n## Sources\n1. https://news.example.test/TODO/article\n';
+  assert.throws(() => validateCitations(bad), /placeholder|TODO/i);
+});
+
+// Oracle R2-003: inline citation URLs must appear under ## Sources too.
+test('validateCitations: rejects inline citation absent from ## Sources (R2-003)', () => {
+  const bad = 'Foo. [Source](https://real.news.test/article-a)\n\n## Sources\n1. https://real.news.test/article-b\n';
+  assert.throws(() => validateCitations(bad), /not listed|Sources/i);
+});
+
+// Positive case: legit response with one inline + matching Sources entry passes.
+test('validateCitations: accepts well-formed response with matching inline + Sources URLs', () => {
+  const good = 'Node 22 is the active LTS. [Source](https://nodejs.org/en/about/previous-releases)\n\n## Sources\n1. https://nodejs.org/en/about/previous-releases\n';
+  assert.doesNotThrow(() => validateCitations(good));
+});
+
+// Positive case: extra entries in Sources beyond inline citations are tolerated.
+test('validateCitations: tolerates Sources entries with no matching inline citation', () => {
+  const good = 'Foo. [Source](https://a.example.test/x)\n\n## Sources\n1. https://a.example.test/x\n2. https://b.example.test/y\n';
+  assert.doesNotThrow(() => validateCitations(good));
+});
