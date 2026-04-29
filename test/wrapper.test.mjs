@@ -27,7 +27,9 @@ import {
   SEARCH_SYSTEM_PROMPT,
   PRIVACY_SYSTEM_SETTINGS,
   buildEnv,
+  setupGeminiHomeOverride,
 } from '../bin/gemini-search.mjs';
+import { existsSync, lstatSync, readlinkSync, statSync } from 'node:fs';
 
 test('stripCode: fenced block citations are dropped', () => {
   const md = '```\n[Source](https://x.com)\n```\n[Source](https://y.com)\n## Sources';
@@ -713,5 +715,56 @@ test('R5 MEDIUM: buildEnv force-disables telemetry env vars even if parent sets 
     else process.env.GEMINI_TELEMETRY_ENABLED = original.GEMINI_TELEMETRY_ENABLED;
     if (original.GEMINI_TELEMETRY_LOG_PROMPTS === undefined) delete process.env.GEMINI_TELEMETRY_LOG_PROMPTS;
     else process.env.GEMINI_TELEMETRY_LOG_PROMPTS = original.GEMINI_TELEMETRY_LOG_PROMPTS;
+  }
+});
+
+// Round 6 (Oracle R6 P2 D1, Phase 1 parity): GEMINI_CLI_HOME override
+// must redirect Gemini CLI's chat-transcript writer to a disposable
+// directory we own. The CLI persists verbatim prompts to
+// `<home>/.gemini/tmp/<projectHash>/chats/session-*.json` regardless of
+// telemetry settings, so the only safe path is per-invocation
+// GEMINI_CLI_HOME isolation + cleanup in finally.
+test('R6 MEDIUM: setupGeminiHomeOverride creates isolated <home>/.gemini and cleans up', () => {
+  const { home, cleanup } = setupGeminiHomeOverride();
+  try {
+    // mkdtemp prefix must be recognizable for forensic cleanup
+    assert.match(home, /gemini-search-home-/);
+    assert.equal(statSync(home).isDirectory(), true);
+    const dotGemini = join(home, '.gemini');
+    assert.equal(statSync(dotGemini).isDirectory(), true);
+    // mode 0o700 — owner-only (defense in depth even though tmpdir is 0700)
+    assert.equal(statSync(dotGemini).mode & 0o777, 0o700);
+  } finally {
+    cleanup();
+  }
+  // After cleanup, the entire override tree must be gone — chat
+  // transcripts written into <home>/.gemini/tmp/.../chats/ are removed
+  // along with the parent directory.
+  assert.equal(existsSync(home), false);
+  // Idempotent cleanup must not throw (signal handler + finally both fire)
+  assert.doesNotThrow(() => cleanup());
+});
+
+test('R6 MEDIUM: buildEnv pins GEMINI_CLI_HOME to per-invocation override', () => {
+  const env = buildEnv('/tmp/sys.json', '/tmp/fake-home');
+  assert.equal(env.GEMINI_CLI_HOME, '/tmp/fake-home');
+  assert.equal(env.GEMINI_CLI_SYSTEM_SETTINGS_PATH, '/tmp/sys.json');
+  // Without geminiHome (legacy callers / unit tests) GEMINI_CLI_HOME must
+  // remain unset so the user's real ~/.gemini still works
+  const envNoHome = buildEnv('/tmp/sys.json');
+  assert.equal(envNoHome.GEMINI_CLI_HOME, undefined);
+});
+
+test('R6 MEDIUM: buildEnv resists parent GEMINI_CLI_HOME injection', () => {
+  // Parent shell setting GEMINI_CLI_HOME=/attacker/dir must not leak into
+  // the child — the override path always wins.
+  const original = process.env.GEMINI_CLI_HOME;
+  process.env.GEMINI_CLI_HOME = '/attacker/path';
+  try {
+    const env = buildEnv('/tmp/sys.json', '/tmp/our-override');
+    assert.equal(env.GEMINI_CLI_HOME, '/tmp/our-override');
+  } finally {
+    if (original === undefined) delete process.env.GEMINI_CLI_HOME;
+    else process.env.GEMINI_CLI_HOME = original;
   }
 });

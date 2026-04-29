@@ -45,6 +45,7 @@ import { stderr } from 'node:process';
 import {
   buildPrompt,
   setupPrivacyOverride,
+  setupGeminiHomeOverride,
   runGeminiBuffered,
   parseAndValidate,
   formatResponse,
@@ -148,22 +149,33 @@ async function handleSearch({ query, raw }) {
   }
 
   let privacy;
+  let geminiHome;
   try {
     privacy = setupPrivacyOverride();
+    geminiHome = setupGeminiHomeOverride();
   } catch (err) {
+    try { privacy?.cleanup?.(); } catch { /* best-effort */ }
+    try { geminiHome?.cleanup?.(); } catch { /* best-effort */ }
     return toolError(`failed to create Gemini privacy override: ${extractErrorMessage(err)}`);
   }
 
   // Allocate the invocation entry up front; the child is registered as
   // soon as runGeminiBuffered spawns it (synchronous callback). Cleanup
-  // is captured here so the shutdown drain can fire it without a closure
-  // over the local `privacy` binding.
-  const entry = { child: null, cleanup: () => privacy.cleanup() };
+  // is captured here so the shutdown drain can fire BOTH the privacy
+  // settings dir AND the GEMINI_CLI_HOME override (Round 6 R6 P2 D1)
+  // without a closure over the local bindings.
+  const entry = {
+    child: null,
+    cleanup: () => {
+      try { privacy.cleanup(); } catch { /* best-effort */ }
+      try { geminiHome.cleanup(); } catch { /* best-effort */ }
+    },
+  };
   activeInvocations.add(entry);
   const registerChild = (child) => { entry.child = child; };
 
   try {
-    const result = await runGeminiBuffered(prompt, 'json', privacy.path, registerChild);
+    const result = await runGeminiBuffered(prompt, 'json', privacy.path, registerChild, geminiHome.home);
     // parseAndValidate enforces the citation contract; on violation it
     // throws and we surface the message to the model so it can retry
     // with a clearer query rather than silently emitting bad sources.
@@ -179,6 +191,7 @@ async function handleSearch({ query, raw }) {
   } finally {
     activeInvocations.delete(entry);
     try { privacy.cleanup(); } catch { /* best-effort */ }
+    try { geminiHome.cleanup(); } catch { /* best-effort */ }
   }
 }
 

@@ -28,8 +28,15 @@
  */
 
 import { execFile, spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { argv, stdin, stdout, stderr } from 'node:process';
 
@@ -299,6 +306,71 @@ function setupPrivacyOverride() {
   return { path, cleanup };
 }
 
+// Round 6 (Oracle R6 P2 D1, parity fix): Gemini CLI's ChatRecordingService
+// unconditionally persists the verbatim user prompt to a JSONL transcript
+// at `<home>/.gemini/tmp/<projectHash>/chats/session-*.json` whenever a
+// non-interactive prompt is processed (packages/core/src/services/
+// chatRecordingService.ts). That write path is independent of
+// `telemetry.enabled`, `telemetry.logPrompts`, and
+// `privacy.usageStatisticsEnabled`, so the round-5 telemetry pins do not
+// stop it. The only documented escape hatch is the `GEMINI_CLI_HOME`
+// environment variable (packages/core/src/utils/paths.ts:homedir()) which
+// redirects every `<home>/.gemini/*` path lookup to a directory we own.
+//
+// We materialize a fresh temp directory per invocation, mkdir
+// `<override>/.gemini/`, and symlink the user's existing auth/identity
+// files (`oauth_creds.json`, `google_accounts.json`, `installation_id`,
+// `settings.json`, `state.json`, `trustedFolders.json`) into it so the
+// CLI stays authenticated against the user's real account. Chat
+// transcripts and any other writes land inside `<override>/.gemini/tmp/`,
+// which is removed in `finally` (along with the symlinks; symlink targets
+// remain owned by the user's real `~/.gemini`).
+const GEMINI_PASSTHROUGH_FILES = [
+  'oauth_creds.json',
+  'google_accounts.json',
+  'installation_id',
+  'settings.json',
+  'state.json',
+  'trustedFolders.json',
+];
+
+function setupGeminiHomeOverride() {
+  const home = mkdtempSync(join(tmpdir(), 'gemini-search-home-'));
+  const dotGemini = join(home, '.gemini');
+  mkdirSync(dotGemini, { recursive: true, mode: 0o700 });
+  const realDotGemini = join(homedir(), '.gemini');
+  for (const name of GEMINI_PASSTHROUGH_FILES) {
+    const target = join(realDotGemini, name);
+    const linkPath = join(dotGemini, name);
+    try {
+      symlinkSync(target, linkPath);
+    } catch {
+      // Symlink can fail (filesystems without symlink support, target
+      // missing). Fall back to a copy; if the target genuinely does not
+      // exist (fresh install), skip — Gemini CLI tolerates absent
+      // optional files like state.json or trustedFolders.json.
+      try {
+        copyFileSync(target, linkPath);
+      } catch {
+        /* best-effort: file may not exist */
+      }
+    }
+  }
+
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try {
+      rmSync(home, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup; ignore
+    }
+  };
+
+  return { home, cleanup };
+}
+
 // Escape Unicode line/paragraph separators (U+2028, U+2029) and bidi
 // override controls (U+202A–U+202E, U+2066–U+2069). JSON.stringify leaves
 // these characters verbatim, but they can visually break out of the quoted
@@ -351,7 +423,7 @@ function stripTerminalControls(s) {
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
 }
 
-function buildEnv(systemSettingsPath) {
+function buildEnv(systemSettingsPath, geminiHome) {
   // Round 5 (parity with Phase 2 R5 MEDIUM): force-disable telemetry env vars
   // for the child process. Gemini CLI's settings merge is
   //   `argv ?? env ?? settings`, so even with telemetry pinned off in the
@@ -362,12 +434,25 @@ function buildEnv(systemSettingsPath) {
   // "false". Per docs/reference/configuration.md, anything other than
   // "true"/"1" is treated as disabling, but we use the explicit "false"
   // literal so the intent is unmistakable in process listings and audit logs.
-  return {
+  //
+  // Round 6 (Oracle R6 P2 D1, parity): also pin GEMINI_CLI_HOME to the
+  // per-invocation override (see setupGeminiHomeOverride), so chat
+  // transcripts persisted by the Gemini CLI ChatRecordingService land
+  // inside a disposable directory that is removed in finally — even
+  // though telemetry/privacy are off, that recorder writes the verbatim
+  // prompt to disk independently. When geminiHome is undefined (e.g.
+  // direct unit tests of buildEnv) we leave GEMINI_CLI_HOME unset so the
+  // CLI falls back to os.homedir().
+  const env = {
     ...process.env,
     GEMINI_CLI_SYSTEM_SETTINGS_PATH: systemSettingsPath,
     GEMINI_TELEMETRY_ENABLED: 'false',
     GEMINI_TELEMETRY_LOG_PROMPTS: 'false',
   };
+  if (geminiHome) {
+    env.GEMINI_CLI_HOME = geminiHome;
+  }
+  return env;
 }
 
 function getTimeout() {
@@ -391,7 +476,7 @@ function makeNotFoundError() {
  * so the caller can record it and kill it on SIGINT/SIGTERM, preventing
  * orphaned `gemini` processes when the wrapper is interrupted.
  */
-function runGeminiBuffered(prompt, outputFormat, systemSettingsPath, registerChild) {
+function runGeminiBuffered(prompt, outputFormat, systemSettingsPath, registerChild, geminiHome) {
   return new Promise((resolve, reject) => {
     const args = [
       '--output-format', outputFormat,
@@ -415,7 +500,7 @@ function runGeminiBuffered(prompt, outputFormat, systemSettingsPath, registerChi
     // hard-kill guarantee as the streaming path.
     const child = execFile('gemini', args, {
       maxBuffer: getMaxBuffer(),
-      env: buildEnv(systemSettingsPath),
+      env: buildEnv(systemSettingsPath, geminiHome),
     }, (error, out, err) => {
       if (error) {
         if (error.code === 'ENOENT') {
@@ -455,7 +540,7 @@ function runGeminiBuffered(prompt, outputFormat, systemSettingsPath, registerChi
 /**
  * True streaming for --stream mode. Pipes stdout/stderr live; no maxBuffer cap.
  */
-function runGeminiStreaming(prompt, systemSettingsPath, registerChild) {
+function runGeminiStreaming(prompt, systemSettingsPath, registerChild, geminiHome) {
   return new Promise((resolve, reject) => {
     const args = [
       '--output-format', 'stream-json',
@@ -463,7 +548,7 @@ function runGeminiStreaming(prompt, systemSettingsPath, registerChild) {
     ];
 
     const child = spawn('gemini', args, {
-      env: buildEnv(systemSettingsPath),
+      env: buildEnv(systemSettingsPath, geminiHome),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     registerChild?.(child);
@@ -1181,18 +1266,32 @@ async function main() {
   // Round 4: wrap the temp-dir setup in our own try so a failure in
   // mkdtempSync()/writeFileSync() prints a clean error instead of a raw
   // Node stack trace from an unhandled rejection in main().
+  //
+  // Round 6 (Oracle R6 P2 D1): setupGeminiHomeOverride() runs alongside
+  // setupPrivacyOverride() so the gemini child writes its session
+  // transcript inside a disposable directory we delete in finally. Both
+  // cleanups must fire on every exit path (success, error, signal) so we
+  // chain them through a single `cleanup` closure.
   let privacy;
+  let geminiHome;
   try {
     privacy = setupPrivacyOverride();
+    geminiHome = setupGeminiHomeOverride();
   } catch (err) {
     stderr.write(`Error: failed to create Gemini privacy override: ${extractErrorMessage(err)}\n`);
+    try { privacy?.cleanup?.(); } catch { /* best-effort */ }
+    try { geminiHome?.cleanup?.(); } catch { /* best-effort */ }
     process.exitCode = 1;
     process.removeListener('SIGINT', onSigint);
     process.removeListener('SIGTERM', onSigterm);
     return;
   }
-  cleanup = privacy.cleanup;
+  cleanup = () => {
+    try { privacy.cleanup(); } catch { /* best-effort */ }
+    try { geminiHome.cleanup(); } catch { /* best-effort */ }
+  };
   const privacyPath = privacy.path;
+  const geminiHomePath = geminiHome.home;
 
   // Swallow EPIPE on stdout/stderr (e.g. `gemini-search ... | head -3`) so it
   // becomes a controlled exit instead of an unhandled stream error that
@@ -1216,11 +1315,11 @@ async function main() {
           'Use the default mode for source-verified answers.\n',
         );
       } catch { /* EPIPE on stderr — ignore */ }
-      await runGeminiStreaming(prompt, privacyPath, registerChild);
+      await runGeminiStreaming(prompt, privacyPath, registerChild, geminiHomePath);
       return;
     }
 
-    const result = await runGeminiBuffered(prompt, 'json', privacyPath, registerChild);
+    const result = await runGeminiBuffered(prompt, 'json', privacyPath, registerChild, geminiHomePath);
 
     // Even in --raw mode we MUST validate the JSON envelope: data.error,
     // empty response, malformed JSON, and missing citations are all
@@ -1307,6 +1406,7 @@ export {
   // buffered spawn, JSON envelope validation, markdown rendering, query
   // length cap, prompt-byte cap) without code duplication.
   setupPrivacyOverride,
+  setupGeminiHomeOverride,
   runGeminiBuffered,
   formatResponse,
   extractErrorMessage,
