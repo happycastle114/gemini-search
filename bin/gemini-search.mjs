@@ -113,9 +113,24 @@ Current date context: ${new Date().toISOString().split('T')[0]}`;
 
 // System-level override settings: highest precedence below CLI args, but does
 // NOT touch the user's ~/.gemini/settings.json or OAuth credentials.
+//
+// Round 5 (parity with Phase 2 R5 MEDIUM): also pin telemetry off. Gemini CLI
+// has a SEPARATE `telemetry` settings block from `privacy.usageStatisticsEnabled`.
+// When `telemetry.enabled` is true, the OpenTelemetry pipeline emits
+// `gemini_cli.user_prompt.prompt` events that include the literal user prompt
+// (default `telemetry.logPrompts: true`), regardless of usage-stats opt-out.
+// Hard-pinning both keys here, plus the env-var pins in buildEnv() below,
+// closes the leak path even if a user previously enabled telemetry in their
+// ~/.gemini/settings.json or set GEMINI_TELEMETRY_ENABLED in their shell.
+// Refs: docs/cli/telemetry.md, packages/core/src/telemetry/config.ts
+// (`enabled = argv.telemetry ?? GEMINI_TELEMETRY_ENABLED ?? settings.enabled`).
 const PRIVACY_SYSTEM_SETTINGS = {
   privacy: {
     usageStatisticsEnabled: false,
+  },
+  telemetry: {
+    enabled: false,
+    logPrompts: false,
   },
 };
 
@@ -337,9 +352,21 @@ function stripTerminalControls(s) {
 }
 
 function buildEnv(systemSettingsPath) {
+  // Round 5 (parity with Phase 2 R5 MEDIUM): force-disable telemetry env vars
+  // for the child process. Gemini CLI's settings merge is
+  //   `argv ?? env ?? settings`, so even with telemetry pinned off in the
+  // system settings file (PRIVACY_SYSTEM_SETTINGS), an inherited
+  // `GEMINI_TELEMETRY_ENABLED=true` from the parent shell would WIN and
+  // re-enable prompt-logging OpenTelemetry events. We override here AFTER
+  // spreading process.env so child process always sees both vars set to
+  // "false". Per docs/reference/configuration.md, anything other than
+  // "true"/"1" is treated as disabling, but we use the explicit "false"
+  // literal so the intent is unmistakable in process listings and audit logs.
   return {
     ...process.env,
     GEMINI_CLI_SYSTEM_SETTINGS_PATH: systemSettingsPath,
+    GEMINI_TELEMETRY_ENABLED: 'false',
+    GEMINI_TELEMETRY_LOG_PROMPTS: 'false',
   };
 }
 
@@ -402,6 +429,18 @@ function runGeminiBuffered(prompt, outputFormat, systemSettingsPath, registerChi
       settle(resolve, out);
     });
     registerChild?.(child);
+    // Round 5 (Oracle R5 P1 LOW): execFile() always opens a writable
+    // stdin pipe to the child even when we have no input to send. A
+    // misbehaving or malicious `gemini` shim that calls process.stdin
+    // .resume() (e.g. an interactive auth prompt mistakenly invoked in
+    // non-TTY mode, or a stdin-reading variant) would block on EOF and
+    // make the wrapper hang until GEMINI_SEARCH_TIMEOUT fires. The
+    // streaming path below avoids this by passing `stdio: ['ignore',
+    // 'pipe', 'pipe']` to spawn(); execFile has no equivalent option,
+    // so we close the pipe explicitly here to deliver EOF immediately.
+    // The optional chain handles the race where execFile threw
+    // synchronously and the child is in a degenerate state.
+    try { child.stdin?.end(); } catch { /* already closed; ignore */ }
 
     const timeoutMs = getTimeout();
     const timer = setTimeout(() => {
@@ -1274,4 +1313,6 @@ export {
   getTimeout,
   DEFAULT_MAX_QUERY_CHARS,
   DEFAULT_MAX_PROMPT_BYTES,
+  PRIVACY_SYSTEM_SETTINGS,
+  buildEnv,
 };

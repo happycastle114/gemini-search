@@ -25,6 +25,8 @@ import {
   isForbiddenHost,
   googleWebSearchSuccessCount,
   SEARCH_SYSTEM_PROMPT,
+  PRIVACY_SYSTEM_SETTINGS,
+  buildEnv,
 } from '../bin/gemini-search.mjs';
 
 test('stripCode: fenced block citations are dropped', () => {
@@ -686,4 +688,30 @@ test('googleWebSearchSuccessCount: returns 0 on missing stats / malformed entrie
   assert.equal(googleWebSearchSuccessCount({ stats: { tools: { byName: { google_web_search: { success: 0 } } } } }), 0);
   assert.equal(googleWebSearchSuccessCount({ stats: { tools: { byName: { google_web_search: { success: 1 } } } } }), 1);
   assert.equal(googleWebSearchSuccessCount({ stats: { tools: { byName: { google_web_search: { success: 3 } } } } }), 3);
+});
+
+test('R5 MEDIUM: PRIVACY_SYSTEM_SETTINGS pins both privacy and telemetry off', () => {
+  assert.equal(PRIVACY_SYSTEM_SETTINGS.privacy.usageStatisticsEnabled, false);
+  assert.equal(PRIVACY_SYSTEM_SETTINGS.telemetry.enabled, false);
+  assert.equal(PRIVACY_SYSTEM_SETTINGS.telemetry.logPrompts, false);
+});
+
+test('R5 MEDIUM: buildEnv force-disables telemetry env vars even if parent sets them', () => {
+  const original = {
+    GEMINI_TELEMETRY_ENABLED: process.env.GEMINI_TELEMETRY_ENABLED,
+    GEMINI_TELEMETRY_LOG_PROMPTS: process.env.GEMINI_TELEMETRY_LOG_PROMPTS,
+  };
+  process.env.GEMINI_TELEMETRY_ENABLED = 'true';
+  process.env.GEMINI_TELEMETRY_LOG_PROMPTS = 'true';
+  try {
+    const env = buildEnv('/tmp/x');
+    assert.equal(env.GEMINI_TELEMETRY_ENABLED, 'false');
+    assert.equal(env.GEMINI_TELEMETRY_LOG_PROMPTS, 'false');
+    assert.equal(env.GEMINI_CLI_SYSTEM_SETTINGS_PATH, '/tmp/x');
+  } finally {
+    if (original.GEMINI_TELEMETRY_ENABLED === undefined) delete process.env.GEMINI_TELEMETRY_ENABLED;
+    else process.env.GEMINI_TELEMETRY_ENABLED = original.GEMINI_TELEMETRY_ENABLED;
+    if (original.GEMINI_TELEMETRY_LOG_PROMPTS === undefined) delete process.env.GEMINI_TELEMETRY_LOG_PROMPTS;
+    else process.env.GEMINI_TELEMETRY_LOG_PROMPTS = original.GEMINI_TELEMETRY_LOG_PROMPTS;
+  }
 });
