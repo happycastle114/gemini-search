@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "happycastle-gemini",
+  "description": "happycastle's Claude Code plugins (Gemini-powered web search)",
+  "owner": {
+    "name": "happycastle",
+    "email": "happycastle114@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "gemini-search",
+      "source": "./",
+      "description": "Privacy-hardened Gemini web search for Claude Code with mandatory citations",
+      "version": "1.0.0",
+      "author": {
+        "name": "happycastle"
+      },
+      "homepage": "https://github.com/happycastle114/gemini-search",
+      "repository": "https://github.com/happycastle114/gemini-search",
+      "license": "MIT",
+      "keywords": ["claude-code", "gemini", "web-search", "google-search", "grounding", "research"],
+      "category": "research"
+    }
+  ]
+}
