@@ -782,7 +782,9 @@ function hasValidInlineCitation(stripped) {
 
 // Hosts the prompt explicitly forbids the model from citing because they
 // are common placeholder/fabricated URLs (oracle R2-003). Keep in sync
-// with rule 2 of SEARCH_SYSTEM_PROMPT.
+// with rule 2 of SEARCH_SYSTEM_PROMPT. Subdomains of these hosts are
+// also rejected (oracle R3-004): `www.example.com`, `docs.example.org`,
+// etc. are still placeholder-shaped URLs.
 const FORBIDDEN_HOSTS = new Set([
   'example.com',
   'example.org',
@@ -792,6 +794,15 @@ const FORBIDDEN_HOSTS = new Set([
   'your-source.com',
 ]);
 const FORBIDDEN_URL_TOKENS = ['...', 'TODO', 'PLACEHOLDER', 'your-source'];
+
+// True iff `host` is exactly a forbidden host or a subdomain of one
+// (oracle R3-004). Hostnames are already lowercased by the URL parser.
+function isForbiddenHost(host) {
+  for (const f of FORBIDDEN_HOSTS) {
+    if (host === f || host.endsWith('.' + f)) return true;
+  }
+  return false;
+}
 
 // Extract the URL set referenced under the `## Sources` heading. First
 // http(s) URL on each non-empty line under the heading; stops at the next
@@ -810,15 +821,52 @@ function extractSourcesSectionUrls(stripped) {
   return urls;
 }
 
-function normalizeUrl(u) {
-  return u.replace(/[.,;:!?)\]]+$/, '').toLowerCase();
+// Strip trailing markdown/sentence punctuation that the model may glue
+// onto a bare URL in `## Sources` lines (e.g. `https://x.test/y).` or
+// `https://x.test/y,`). Critically, we DO NOT lowercase the URL: paths
+// and query strings are case-sensitive per RFC 3986, and the prompt
+// requires byte-for-byte URL identity (oracle R3-003 / R3-001 P2).
+function trimUrlPunctuation(u) {
+  return u.replace(/[.,;:!?)\]]+$/, '');
+}
+
+// Locate the line index immediately after the LAST recognised source-list
+// line under `## Sources`. A source-list line is either a numbered entry
+// (`1.`, `1)`), a bullet (`-`, `*`, `+`), or an inline-link entry whose
+// only content is a bare URL or `[text](url)`. Blank lines between
+// entries are tolerated. Returns -1 if no `## Sources` heading exists.
+// Used to enforce R3-004 P2: nothing but blank lines may follow the
+// final source entry (Sources MUST be the trailing content block).
+function sourcesSectionEndLine(stripped) {
+  const lines = stripped.split('\n');
+  const startIdx = lines.findIndex((l) => /^## Sources\s*$/.test(l));
+  if (startIdx < 0) return -1;
+  // Match a single Sources entry: optional list marker + URL-bearing token.
+  // Permissive enough to accept `1. https://x`, `* [t](https://x)`,
+  // `- https://x`, or a bare `https://x`.
+  const ENTRY_RE = /^\s*(?:[-*+]|\d+[.)])?\s*(?:\[[^\]]*\]\()?https?:\/\/\S+/;
+  let lastEntryIdx = startIdx; // header counts as the floor
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    const line = lines[i] ?? '';
+    if (ENTRY_RE.test(line)) {
+      lastEntryIdx = i;
+      continue;
+    }
+    if (line.trim() === '') continue; // blank lines between entries
+    // Anything else (next heading, prose, etc.) terminates the section.
+    break;
+  }
+  return lastEntryIdx + 1;
 }
 
 // Validate the citation contract:
 // 1. `## Sources` heading present
 // 2. ≥1 inline `[Source](http(s)://URL)` outside code/HTML
-// 3. No URL hits a forbidden placeholder host or token (R2-003)
-// 4. Inline-citation URL set ⊆ Sources-section URL set (R2-003)
+// 3. No URL hits a forbidden placeholder host (incl. subdomains) or token
+// 4. Inline-citation URL set EQUALS Sources-section URL set (one-to-one,
+//    no extras either direction; oracle R3-002)
+// 5. URL comparison is byte-for-byte after trimming trailing punctuation
+//    only — no case folding (oracle R3-003)
 // Throws with a human-readable reason on contract violation.
 function validateCitations(markdown) {
   const stripped = stripCode(markdown);
@@ -827,6 +875,19 @@ function validateCitations(markdown) {
   }
   if (!SOURCES_SECTION_RE.test(stripped)) {
     throw new Error('Gemini response did not include a "## Sources" section. Refusing to return uncited content.');
+  }
+  // Oracle R3-004 P2: `## Sources` must be the FINAL content section.
+  // Trailing prose after Sources is an audit-trail leak vector — the model
+  // could append uncited claims that read as if they were sourced.
+  const endIdx = sourcesSectionEndLine(stripped);
+  if (endIdx >= 0) {
+    const lines = stripped.split('\n');
+    for (let i = endIdx; i < lines.length; i++) {
+      const line = lines[i] ?? '';
+      if (line.trim() !== '') {
+        throw new Error('Content found after `## Sources` section. The Sources block MUST be the final section of the response (audit-trail integrity).');
+      }
+    }
   }
   INLINE_CITATION_RE.lastIndex = 0;
   const inlineUrls = [];
@@ -842,7 +903,7 @@ function validateCitations(markdown) {
     } catch {
       throw new Error(`Gemini response cited an unparseable URL: ${url}`);
     }
-    if (FORBIDDEN_HOSTS.has(host)) {
+    if (isForbiddenHost(host)) {
       throw new Error(`Gemini response cited a forbidden placeholder URL host: ${host}`);
     }
     const lower = url.toLowerCase();
@@ -852,10 +913,19 @@ function validateCitations(markdown) {
       }
     }
   }
-  const sourcesSet = new Set(sourcesUrls.map(normalizeUrl));
-  for (const u of inlineUrls) {
-    if (!sourcesSet.has(normalizeUrl(u))) {
+  // Set equality: every inline URL must be in Sources, AND every Sources
+  // URL must be cited inline (oracle R3-002). Trim only trailing
+  // punctuation; preserve case (oracle R3-003).
+  const inlineSet = new Set(inlineUrls.map(trimUrlPunctuation));
+  const sourcesSet = new Set(sourcesUrls.map(trimUrlPunctuation));
+  for (const u of inlineSet) {
+    if (!sourcesSet.has(u)) {
       throw new Error(`Inline citation URL not listed under \`## Sources\`: ${u}`);
+    }
+  }
+  for (const u of sourcesSet) {
+    if (!inlineSet.has(u)) {
+      throw new Error(`\`## Sources\` lists URL not cited inline (audit-trail integrity): ${u}`);
     }
   }
 }
@@ -872,6 +942,28 @@ function extractErrorMessage(err) {
     }
   }
   return String(err);
+}
+
+/**
+ * Parses Gemini JSON output and validates citations + error/empty payloads.
+ * Returns the parsed `{ response, stats }` shape. Throws on malformed JSON,
+ * error payloads, empty responses, or missing inline citations / Sources
+ * heading.
+ */
+// Inspect Gemini CLI JSON `stats.tools.byName.google_web_search` and
+// return the success count. Returns 0 when the field is missing (e.g.
+// older CLI versions, or the model truly skipped the tool). Used to
+// enforce that any cited response was backed by ≥1 successful
+// google_web_search invocation in this exact CLI run (oracle R3-001
+// partial: Gemini CLI does not expose grounding URLs, so we cannot
+// cross-check URL provenance — but we CAN prove search was invoked).
+function googleWebSearchSuccessCount(data) {
+  const byName = data?.stats?.tools?.byName;
+  if (!byName || typeof byName !== 'object') return 0;
+  const entry = byName.google_web_search;
+  if (!entry || typeof entry !== 'object') return 0;
+  const success = Number(entry.success);
+  return Number.isFinite(success) && success > 0 ? success : 0;
 }
 
 /**
@@ -897,10 +989,28 @@ function parseAndValidate(jsonStr) {
     throw new Error('Gemini CLI returned an empty response.');
   }
 
+  const searchCount = googleWebSearchSuccessCount(data);
+
   // Prompt rule 6: zero-results fallback. Bypass citation contract when
-  // the model emits the literal NO_RESULTS token (oracle R2-002).
+  // the model emits the literal NO_RESULTS token (oracle R2-002). Tied
+  // to evidence that a search was attempted (oracle R3-005): if the
+  // model emits NO_RESULTS without ever invoking google_web_search, it
+  // most likely skipped the tool entirely — reject as a false negative.
   if (response.trim() === 'NO_RESULTS') {
+    if (searchCount === 0) {
+      throw new Error('Gemini emitted NO_RESULTS without invoking google_web_search. Refusing — search was never attempted.');
+    }
     return data;
+  }
+
+  // Cited responses MUST be backed by a successful google_web_search in
+  // this run (oracle R3-001 partial). We cannot verify the cited URLs
+  // came from the grounding result set because Gemini CLI does not
+  // expose grounding URLs — but we can at least catch the worst case
+  // where the model fabricated citations from training data without
+  // searching at all.
+  if (searchCount === 0) {
+    throw new Error('Gemini response includes citations but no successful google_web_search call was recorded in stats. Refusing — citations cannot be backed by web search evidence.');
   }
 
   validateCitations(response);
@@ -1148,6 +1258,8 @@ export {
   terminateChild,
   stripTerminalControls,
   buildPrompt,
+  isForbiddenHost,
+  googleWebSearchSuccessCount,
   SEARCH_SYSTEM_PROMPT,
   INLINE_CITATION_RE,
   SOURCES_SECTION_RE,

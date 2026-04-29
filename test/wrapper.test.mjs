@@ -22,6 +22,8 @@ import {
   terminateChild,
   stripTerminalControls,
   buildPrompt,
+  isForbiddenHost,
+  googleWebSearchSuccessCount,
   SEARCH_SYSTEM_PROMPT,
 } from '../bin/gemini-search.mjs';
 
@@ -534,15 +536,46 @@ test('buildPrompt: escapes bidi override controls U+202A-202E and U+2066-2069 (R
 // Oracle R2-002: prompt rule 6 mandates literal NO_RESULTS on zero hits.
 // parseAndValidate must short-circuit and return the data unmodified
 // without invoking validateCitations (which would otherwise reject a
-// response lacking `## Sources`).
-test('parseAndValidate: NO_RESULTS bypasses citation contract (R2-002)', () => {
-  const data = parseAndValidate('{"response":"NO_RESULTS"}');
+// response lacking `## Sources`). Oracle R3-005 additionally requires
+// evidence that google_web_search was actually invoked — otherwise the
+// model is suspected of skipping the tool entirely.
+const SEARCH_OK_STATS = '"stats":{"tools":{"byName":{"google_web_search":{"count":1,"success":1,"fail":0}}}}';
+
+test('parseAndValidate: NO_RESULTS bypasses citation contract (R2-002 + R3-005)', () => {
+  const data = parseAndValidate(`{"response":"NO_RESULTS",${SEARCH_OK_STATS}}`);
   assert.equal(data.response, 'NO_RESULTS');
 });
 
-test('parseAndValidate: NO_RESULTS with surrounding whitespace also bypasses (R2-002)', () => {
-  const data = parseAndValidate('{"response":"  NO_RESULTS  \\n"}');
+test('parseAndValidate: NO_RESULTS with surrounding whitespace also bypasses (R2-002 + R3-005)', () => {
+  const data = parseAndValidate(`{"response":"  NO_RESULTS  \\n",${SEARCH_OK_STATS}}`);
   assert.equal(typeof data.response, 'string');
+});
+
+// Oracle R3-005: NO_RESULTS without a successful google_web_search call
+// indicates the model skipped the tool entirely. Reject as a false
+// negative (silent contract failure for the "real web search" promise).
+test('parseAndValidate: rejects NO_RESULTS when google_web_search was never invoked (R3-005)', () => {
+  assert.throws(
+    () => parseAndValidate('{"response":"NO_RESULTS"}'),
+    /search was never attempted|google_web_search/i,
+  );
+});
+
+// Oracle R3-001: cited responses MUST be backed by ≥1 successful
+// google_web_search call. Catches the worst case where the model
+// fabricated citations from training data without searching.
+test('parseAndValidate: rejects cited response when google_web_search was never invoked (R3-001)', () => {
+  const json = '{"response":"Foo. [Source](https://nodejs.org/x)\\n\\n## Sources\\n1. https://nodejs.org/x"}';
+  assert.throws(
+    () => parseAndValidate(json),
+    /no successful google_web_search|web search evidence/i,
+  );
+});
+
+test('parseAndValidate: accepts cited response when google_web_search succeeded (R3-001)', () => {
+  const json = `{"response":"Foo. [Source](https://nodejs.org/x)\\n\\n## Sources\\n1. https://nodejs.org/x",${SEARCH_OK_STATS}}`;
+  const data = parseAndValidate(json);
+  assert.match(data.response, /Source/);
 });
 
 // Oracle R2-003: validator must reject responses that cite forbidden
@@ -579,8 +612,78 @@ test('validateCitations: accepts well-formed response with matching inline + Sou
   assert.doesNotThrow(() => validateCitations(good));
 });
 
-// Positive case: extra entries in Sources beyond inline citations are tolerated.
-test('validateCitations: tolerates Sources entries with no matching inline citation', () => {
-  const good = 'Foo. [Source](https://a.example.test/x)\n\n## Sources\n1. https://a.example.test/x\n2. https://b.example.test/y\n';
+// Oracle R3-002: extras in `## Sources` beyond inline citations break
+// audit-trail integrity. Validator now enforces SET EQUALITY (one-to-one).
+test('validateCitations: rejects Sources entries with no matching inline citation (R3-002)', () => {
+  const bad = 'Foo. [Source](https://a.example.test/x)\n\n## Sources\n1. https://a.example.test/x\n2. https://b.example.test/y\n';
+  assert.throws(() => validateCitations(bad), /not cited inline|audit-trail/i);
+});
+
+// Oracle R3-003: URL comparison is byte-for-byte (case-sensitive paths
+// per RFC 3986). `Path` and `path` are different resources.
+test('validateCitations: rejects case-mismatched URL between inline and Sources (R3-003)', () => {
+  const bad = 'Foo. [Source](https://site.test/CaseSensitive)\n\n## Sources\n1. https://site.test/casesensitive\n';
+  assert.throws(() => validateCitations(bad), /not listed|not cited/i);
+});
+
+// Oracle R3-003: trailing punctuation that the model glues onto a bare
+// URL in `## Sources` is an artifact, not a different resource. Trim it.
+test('validateCitations: tolerates trailing punctuation on Sources URLs (R3-003)', () => {
+  const good = 'Foo [Source](https://site.test/x).\n\n## Sources\n1. https://site.test/x.\n';
   assert.doesNotThrow(() => validateCitations(good));
+});
+
+// Oracle R3-004: forbidden hosts apply to subdomains too. Otherwise the
+// model can bypass the placeholder denylist via `www.example.com`.
+test('validateCitations: rejects www subdomain of forbidden host (R3-004)', () => {
+  const bad = 'Foo [Source](https://www.example.com/x)\n\n## Sources\n1. https://www.example.com/x\n';
+  assert.throws(() => validateCitations(bad), /forbidden|placeholder/i);
+});
+
+test('validateCitations: rejects deep subdomain of forbidden host (R3-004)', () => {
+  const bad = 'Foo [Source](https://docs.api.example.org/v1)\n\n## Sources\n1. https://docs.api.example.org/v1\n';
+  assert.throws(() => validateCitations(bad), /forbidden|placeholder/i);
+});
+
+test('isForbiddenHost: matches exact + any subdomain depth (R3-004)', () => {
+  assert.equal(isForbiddenHost('example.com'), true);
+  assert.equal(isForbiddenHost('www.example.com'), true);
+  assert.equal(isForbiddenHost('a.b.c.example.com'), true);
+  assert.equal(isForbiddenHost('your-source.com'), true);
+  assert.equal(isForbiddenHost('sub.your-source.com'), true);
+  assert.equal(isForbiddenHost('notexample.com'), false);
+  assert.equal(isForbiddenHost('example.com.evil.test'), false);
+  assert.equal(isForbiddenHost('nodejs.org'), false);
+});
+
+// Oracle R3-004 P2: `## Sources` must be the FINAL content block. Trailing
+// prose is an audit-trail leak vector — the model could smuggle uncited
+// claims after the source list that read as if they were sourced.
+test('validateCitations: rejects content after `## Sources` section (R3-004 P2)', () => {
+  const bad = 'Foo [Source](https://x.test/y)\n\n## Sources\n1. https://x.test/y\n\nAnd one more uncited claim.\n';
+  assert.throws(() => validateCitations(bad), /after `## Sources`|final section/i);
+});
+
+test('validateCitations: rejects subsequent ATX heading after `## Sources` (R3-004 P2)', () => {
+  const bad = 'Foo [Source](https://x.test/y)\n\n## Sources\n1. https://x.test/y\n\n## Notes\nExtra commentary.\n';
+  assert.throws(() => validateCitations(bad), /after `## Sources`|final section/i);
+});
+
+test('validateCitations: tolerates trailing blank lines after `## Sources` (R3-004 P2)', () => {
+  const good = 'Foo [Source](https://x.test/y)\n\n## Sources\n1. https://x.test/y\n\n\n';
+  assert.doesNotThrow(() => validateCitations(good));
+});
+
+// Oracle R3-001: googleWebSearchSuccessCount must read stats safely
+// even when the JSON shape is partially missing or malformed.
+test('googleWebSearchSuccessCount: returns 0 on missing stats / malformed entries', () => {
+  assert.equal(googleWebSearchSuccessCount({}), 0);
+  assert.equal(googleWebSearchSuccessCount({ stats: {} }), 0);
+  assert.equal(googleWebSearchSuccessCount({ stats: { tools: {} } }), 0);
+  assert.equal(googleWebSearchSuccessCount({ stats: { tools: { byName: {} } } }), 0);
+  assert.equal(googleWebSearchSuccessCount({ stats: { tools: { byName: { google_web_search: null } } } }), 0);
+  assert.equal(googleWebSearchSuccessCount({ stats: { tools: { byName: { google_web_search: { success: 'x' } } } } }), 0);
+  assert.equal(googleWebSearchSuccessCount({ stats: { tools: { byName: { google_web_search: { success: 0 } } } } }), 0);
+  assert.equal(googleWebSearchSuccessCount({ stats: { tools: { byName: { google_web_search: { success: 1 } } } } }), 1);
+  assert.equal(googleWebSearchSuccessCount({ stats: { tools: { byName: { google_web_search: { success: 3 } } } } }), 3);
 });

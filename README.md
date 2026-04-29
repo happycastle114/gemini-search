@@ -201,6 +201,23 @@ gemini-search/
 6. **No model flag** — Gemini CLI's built-in routing picks the right model. Override via `~/.gemini/settings.json` if needed.
 7. **Cleanup-safe** — Signal handlers are registered before the temp dir is created. On `SIGINT`/`SIGTERM` the wrapper kills the active `gemini` child (with a `SIGKILL` fallback after a short grace window so it never orphans), removes the temp privacy-override directory, and re-raises the signal so the parent shell sees the correct exit status.
 
+## Citation Contract & Provenance Limits
+
+The wrapper enforces a strict citation contract on every non-`NO_RESULTS` response and rejects with a non-zero exit otherwise:
+
+| Check | Rule |
+|-------|------|
+| `## Sources` heading | Required, on its own line, exactly `## Sources` |
+| Inline citations | ≥1 `[Source](https://…)` outside fenced/inline code spans and HTML |
+| Forbidden hosts | `example.com`/`.org`/`.net`, `foo.com`, `bar.com`, `your-source.com` — **including all subdomains** (`www.example.com`, `docs.api.example.org`, …) |
+| Forbidden URL tokens | URL substring match (case-insensitive): `...`, `TODO`, `PLACEHOLDER`, `your-source` |
+| Inline ↔ Sources mapping | **Set equality** — every inline URL must appear in `## Sources` AND every `## Sources` URL must appear inline (no extras either direction) |
+| URL comparison | **Byte-identical** after trimming trailing `.,;:!?)]` punctuation only — **no case folding** (RFC 3986 §3.3 paths are case-sensitive) |
+| `## Sources` placement | Must be the **final** content block — no prose or headings may follow |
+| `google_web_search` invocation | The Gemini CLI `stats.tools.byName.google_web_search.success` counter MUST be ≥ 1 (cited responses without a successful search call are rejected; `NO_RESULTS` without a search call is also rejected) |
+
+**Provenance limit (honest disclosure):** Gemini CLI's `--output-format json` stats expose only the *count* of `google_web_search` invocations, **not the URL set returned by the grounding tool**. The wrapper can therefore prove that a web search was actually attempted and succeeded in this run, but it **cannot** cross-check that each cited URL came from that grounding result set. The system prompt instructs the model to never invent or paraphrase URLs, and the structural / placeholder / set-equality checks above catch the most common fabrication failure modes — but a malicious or buggy model that returns *real-looking but non-grounded* URLs from training data would still pass validation. Treat the citation contract as a high-quality structural filter, not a cryptographic provenance guarantee.
+
 ## Development
 
 ```bash
