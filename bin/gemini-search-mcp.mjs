@@ -95,11 +95,35 @@ function getMaxPromptBytes() {
   return Number.isFinite(v) && v > 0 ? v : DEFAULT_MAX_PROMPT_BYTES;
 }
 
+// Module-level set of in-flight invocations. Each entry owns a child
+// process and a privacy-override cleanup callback. The shutdown handler
+// drains this set so SIGTERM/SIGINT during an active tool call cannot
+// orphan a gemini child or leak a /tmp/gemini-search-priv-* directory.
+// Concurrent tool calls are isolated: each call owns its own entry, and
+// removal happens in the handler's finally block before the response is
+// returned to the transport.
+const activeInvocations = new Set();
+
+async function drainActiveInvocations() {
+  // Snapshot first because terminateChild + cleanup mutate the set via
+  // the handler's finally clause if the child exits during termination.
+  const entries = Array.from(activeInvocations);
+  await Promise.all(
+    entries.map(async (entry) => {
+      try { await terminateChild(entry.child); } catch { /* best-effort */ }
+      try { entry.cleanup(); } catch { /* best-effort */ }
+      activeInvocations.delete(entry);
+    }),
+  );
+}
+
 // Single-flight tool handler. Each invocation gets its own privacy
 // override directory and its own gemini child process; nothing is shared
 // across concurrent calls so a burst of tool calls cannot leak each
 // other's state. The handler always cleans up its temp dir even on
-// error or cancellation.
+// error or cancellation, AND registers itself in `activeInvocations`
+// so the signal handler can terminate the child + remove the temp dir
+// if MCP shutdown lands mid-flight.
 async function handleSearch({ query, raw }) {
   if (typeof query !== 'string' || query.length === 0) {
     return toolError('query must be a non-empty string');
@@ -130,8 +154,13 @@ async function handleSearch({ query, raw }) {
     return toolError(`failed to create Gemini privacy override: ${extractErrorMessage(err)}`);
   }
 
-  let activeChild = null;
-  const registerChild = (child) => { activeChild = child; };
+  // Allocate the invocation entry up front; the child is registered as
+  // soon as runGeminiBuffered spawns it (synchronous callback). Cleanup
+  // is captured here so the shutdown drain can fire it without a closure
+  // over the local `privacy` binding.
+  const entry = { child: null, cleanup: () => privacy.cleanup() };
+  activeInvocations.add(entry);
+  const registerChild = (child) => { entry.child = child; };
 
   try {
     const result = await runGeminiBuffered(prompt, 'json', privacy.path, registerChild);
@@ -145,9 +174,10 @@ async function handleSearch({ query, raw }) {
     // Best-effort: if the child is still alive when we hit an error
     // path, terminate it so we do not leak a gemini process across MCP
     // calls. Errors from terminateChild are themselves swallowed.
-    try { await terminateChild(activeChild); } catch { /* ignore */ }
+    try { await terminateChild(entry.child); } catch { /* ignore */ }
     return toolError(extractErrorMessage(err));
   } finally {
+    activeInvocations.delete(entry);
     try { privacy.cleanup(); } catch { /* best-effort */ }
   }
 }
@@ -238,24 +268,35 @@ async function startServer() {
   }
 
   // Graceful shutdown on signals. The transport's own cleanup is
-  // idempotent so repeated signals do not throw.
+  // idempotent so repeated signals do not throw. Order is critical:
+  //   1. Drain active invocations (terminate gemini children, remove
+  //      privacy temp dirs) BEFORE closing the server transport, so we
+  //      never strand a child whose stderr/stdout is being read by a
+  //      transport pipe that is about to close.
+  //   2. Close the MCP server (idempotent).
+  //   3. Re-raise the signal with the default disposition so the parent
+  //      (Claude Code) sees the conventional 128+signum exit code.
   let shuttingDown = false;
   const shutdown = async (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    try { await drainActiveInvocations(); } catch { /* ignore */ }
     try { await server.close(); } catch { /* ignore */ }
-    // Re-raise so the parent (Claude Code) sees the conventional exit
-    // code; if re-raise fails (rare), fall back to 128+signum so the
-    // process never lingers.
     const SIGNUM = { SIGINT: 2, SIGTERM: 15 };
     try {
+      // Restore default disposition before re-raising so this listener
+      // does not re-trigger and the kernel emits the conventional exit
+      // code. Without this, the second SIGTERM hits our once() handler's
+      // shuttingDown guard and process.kill becomes a no-op delivery
+      // that the runtime ignores, leaving the process to exit(0).
+      process.removeAllListeners(signal);
       process.kill(process.pid, signal);
     } catch {
       process.exit(128 + (SIGNUM[signal] ?? 0));
     }
   };
-  process.once('SIGINT', () => shutdown('SIGINT'));
-  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => { shutdown('SIGINT'); });
+  process.once('SIGTERM', () => { shutdown('SIGTERM'); });
 }
 
 // Only run when invoked as a script. Mirrors the CLI's symlink-aware
