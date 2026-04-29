@@ -43,18 +43,46 @@ npm install -g @google/gemini-cli
 gemini  # authenticate on first run
 ```
 
-### As Claude Code Plugin
+### As a Claude Code plugin (recommended)
 
-```bash
-claude plugin add @happycastle/gemini-search
+Inside Claude Code, add this repo as a marketplace and install the plugin:
+
+```text
+/plugin marketplace add happycastle114/gemini-search
+/plugin install gemini-search@happycastle-gemini
 ```
 
-Or install from source:
+That's it. `/search`, `/research`, and the `web-search` / `research` skills are now available.
+
+To update later:
+
+```text
+/plugin marketplace update happycastle-gemini
+```
+
+### Alternative: install from a local clone
 
 ```bash
 git clone https://github.com/happycastle114/gemini-search.git
-claude --plugin-dir ./gemini-search
 ```
+
+Then in Claude Code:
+
+```text
+/plugin marketplace add ./gemini-search
+/plugin install gemini-search@happycastle-gemini
+```
+
+### Alternative: standalone CLI via npm
+
+If you only want the `gemini-search` binary (no Claude Code plugin):
+
+```bash
+npm install -g @happycastle/gemini-search
+gemini-search "latest Node.js LTS version"
+```
+
+> Note: `claude plugin install @happycastle/gemini-search` does **not** work — Claude Code plugins are distributed via marketplace catalogs (`.claude-plugin/marketplace.json`), not npm package names. Use the marketplace flow above.
 
 ## Usage
 
