@@ -10,7 +10,8 @@
     "url": "https://github.com/happycastle114/gemini-search.git"
   },
   "bin": {
-    "gemini-search": "./bin/gemini-search.mjs"
+    "gemini-search": "./bin/gemini-search.mjs",
+    "gemini-search-mcp": "./bin/gemini-search-mcp.mjs"
   },
   "files": [
     ".claude-plugin",
@@ -29,10 +30,14 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test test/wrapper.test.mjs",
-    "lint": "node --check bin/gemini-search.mjs",
+    "test": "node --test test/wrapper.test.mjs test/mcp-smoke.test.mjs",
+    "lint": "node --check bin/gemini-search.mjs && node --check bin/gemini-search-mcp.mjs",
     "release": "semantic-release",
     "prepublishOnly": "npm run lint && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@semantic-release/commit-analyzer": "13.0.1",

@@ -1263,4 +1263,15 @@ export {
   SEARCH_SYSTEM_PROMPT,
   INLINE_CITATION_RE,
   SOURCES_SECTION_RE,
+  // R12 additions: MCP server reuses the validated CLI pipeline so the
+  // tool gets the same anti-hallucination guarantees (privacy override,
+  // buffered spawn, JSON envelope validation, markdown rendering, query
+  // length cap, prompt-byte cap) without code duplication.
+  setupPrivacyOverride,
+  runGeminiBuffered,
+  formatResponse,
+  extractErrorMessage,
+  getTimeout,
+  DEFAULT_MAX_QUERY_CHARS,
+  DEFAULT_MAX_PROMPT_BYTES,
 };

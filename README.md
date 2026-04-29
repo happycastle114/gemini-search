@@ -102,6 +102,45 @@ The plugin includes two skills that Claude Code activates automatically:
 - **web-search** — Triggers on "search the web", "look up", "find online", "what's the latest", "current version of"
 - **research** — Triggers on "research", "deep dive", "investigate thoroughly", "comprehensive analysis"
 
+### MCP Tool (Native model invocation)
+
+Installing this plugin **auto-registers a Model Context Protocol (MCP) server** so the model can invoke web search natively, the same way it would call a built-in tool. No `.mcp.json` editing required — the plugin's `plugin.json` declares the server and Claude Code wires it up on `/plugin install`.
+
+| Tool name | When the model uses it |
+|-----------|----------------------|
+| `gemini_web_search` | Auto-invoked whenever the model needs current/real-world info: latest versions, recent news, live docs, evolving best practices, anything that may have changed since training cutoff. |
+
+The tool returns the same citation-validated markdown the CLI does (`[Source](URL)` inline + `## Sources` block, byte-identical to grounding URLs, set-equality enforced). Set `raw: true` in the tool arguments to get the raw Gemini JSON envelope instead.
+
+> The MCP server is the same `gemini-search` pipeline (privacy override, anti-hallucination citation contract, tool-invocation evidence gating) — just exposed over [stdio JSON-RPC](https://modelcontextprotocol.io) so the model's tool router can call it directly.
+
+You can also wire the MCP server into another MCP-aware client (Cursor, Windsurf, raw Claude Desktop, etc.) by pointing it at the bundled binary:
+
+```jsonc
+{
+  "mcpServers": {
+    "gemini-search": {
+      // -p installs the package, --package selects which bin to run.
+      // (npx 's first positional arg becomes argv[0] of the chosen bin,
+      //  not a bin name — so a multi-bin package needs --package + the
+      //  bin name passed via the dedicated runner syntax below.)
+      "command": "npx",
+      "args": ["-y", "--package=@happycastle/gemini-search", "gemini-search-mcp"]
+    }
+  }
+}
+```
+
+Or, if you have it installed globally (`npm i -g @happycastle/gemini-search`):
+
+```jsonc
+{
+  "mcpServers": {
+    "gemini-search": { "command": "gemini-search-mcp" }
+  }
+}
+```
+
 ### CLI (Direct)
 
 The `gemini-search` binary is added to PATH during Claude Code sessions:
@@ -168,9 +207,11 @@ If you need a hard guarantee that your prompts are not used for model training, 
 ```
 gemini-search/
 ├── .claude-plugin/
-│   └── plugin.json          # Plugin manifest
+│   ├── plugin.json          # Plugin manifest (auto-registers MCP server)
+│   └── marketplace.json     # Marketplace catalog
 ├── bin/
-│   └── gemini-search.mjs    # CLI wrapper (added to PATH)
+│   ├── gemini-search.mjs        # CLI wrapper (added to PATH)
+│   └── gemini-search-mcp.mjs    # Stdio MCP server (gemini_web_search tool)
 ├── skills/
 │   ├── web-search/
 │   │   └── SKILL.md         # Web search skill
