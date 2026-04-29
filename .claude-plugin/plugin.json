@@ -1,7 +1,7 @@
 {
   "name": "gemini-search",
   "description": "Web search tool for Claude Code powered by Gemini CLI. Google Search grounding with structured JSON output, source citations, and research workflows.",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": {
     "name": "happycastle",
     "url": "https://github.com/happycastle114"
